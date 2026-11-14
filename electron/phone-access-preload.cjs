@@ -15,6 +15,11 @@ contextBridge.exposeInMainWorld("phoneAccess", {
 		ipcRenderer.on("lh:phone:paired", listener);
 		return () => ipcRenderer.removeListener("lh:phone:paired", listener);
 	},
+	onPairCancelled: (cb) => {
+		const listener = () => cb();
+		ipcRenderer.on("lh:phone:pair-cancelled", listener);
+		return () => ipcRenderer.removeListener("lh:phone:pair-cancelled", listener);
+	},
 	onChanged: (cb) => {
 		const listener = (_event, snapshot) => cb(snapshot);
 		ipcRenderer.on("lh:phone:changed", listener);

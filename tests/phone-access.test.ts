@@ -100,7 +100,7 @@ test("addresses list Tailscale first and skip loopback and IPv6", () => {
 
 interface Seen { method: string; url: string; headers: http.IncomingHttpHeaders; body: string }
 
-async function harness(options: { now?: () => number; upstream?: http.RequestListener } = {}) {
+async function harness(options: { now?: () => number; upstream?: http.RequestListener; onPairingCancelled?: (reason: string) => void } = {}) {
 	const seen: Seen[] = [];
 	const upstream = http.createServer(options.upstream ?? ((req, res) => {
 		const chunks: Buffer[] = [];
@@ -115,7 +115,7 @@ async function harness(options: { now?: () => number; upstream?: http.RequestLis
 	const upstreamURL = `http://127.0.0.1:${(upstream.address() as AddressInfo).port}`;
 	const store = createPhoneAccessStore(tempFile());
 	const paired: Array<{ id: string; name: string }> = [];
-	const gateway = createPhoneGateway({ store, target: () => ({ url: upstreamURL, secret: SECRET }), info: { name: "test-mac", version: "0.0.0" }, now: options.now, onPaired: (d: { id: string; name: string }) => paired.push(d) });
+	const gateway = createPhoneGateway({ store, target: () => ({ url: upstreamURL, secret: SECRET }), info: { name: "test-mac", version: "0.0.0" }, now: options.now, onPaired: (d: { id: string; name: string }) => paired.push(d), onPairingCancelled: options.onPairingCancelled });
 	const addr = await gateway.start({ host: "127.0.0.1", port: 0 });
 	const base = `http://127.0.0.1:${addr.port}`;
 	const close = async () => {
@@ -160,12 +160,34 @@ test("pairing: an expired code is refused", async () => {
 	}
 });
 
-test("pairing: too many failed attempts are rate-limited", async () => {
+test("pairing: 10 wrong codes cancel the active code; a new code works at once", async () => {
+	const cancelled: string[] = [];
+	const h = await harness({ onPairingCancelled: (reason: string) => cancelled.push(reason) });
+	try {
+		const first = h.gateway.startPairing();
+		for (let i = 0; i < 9; i++) assert.equal((await h.pair(`bad-${i}`)).status, 401);
+		assert.deepEqual(cancelled, [], "9 wrong codes do not cancel");
+		assert.equal((await h.pair("bad-9")).status, 401);
+		assert.deepEqual(cancelled, ["too-many-attempts"]);
+		assert.equal((await h.pair(first.code)).status, 401, "the cancelled code no longer pairs");
+		// No global lockout: a new code starts at zero and pairs at once.
+		const second = h.gateway.startPairing();
+		assert.equal((await h.pair(second.code)).status, 200);
+	} finally {
+		await h.close();
+	}
+});
+
+test("pairing: wrong codes count against the active code only", async () => {
 	const h = await harness();
 	try {
+		for (let i = 0; i < 20; i++) assert.equal((await h.pair(`bad-${i}`)).status, 401, "no code: refused, no lockout");
 		const { code } = h.gateway.startPairing();
-		for (let i = 0; i < 10; i++) assert.equal((await h.pair(`bad-${i}`)).status, 401);
-		assert.equal((await h.pair(code)).status, 429, "valid code also waits during the limit");
+		for (let i = 0; i < 5; i++) await h.pair(`bad-${i}`);
+		const again = h.gateway.startPairing(); // a new code resets the count
+		for (let i = 0; i < 9; i++) await h.pair(`bad-${i}`);
+		assert.equal((await h.pair(again.code)).status, 200);
+		assert.equal((await h.pair(code)).status, 401, "the replaced code is gone");
 	} finally {
 		await h.close();
 	}
@@ -285,6 +307,49 @@ test("a phone that disconnects closes the upstream request", async () => {
 		await res.body!.getReader().read();
 		controller.abort();
 		await Promise.race([closed, new Promise((_, rej) => setTimeout(() => rej(new Error("upstream not closed")), 2000))]);
+	} finally {
+		await h.close();
+	}
+});
+
+test("revoke closes the device's open streams on both sides; other devices keep theirs", async () => {
+	const upstreamClosed: string[] = [];
+	const h = await harness({
+		upstream: (req, res) => {
+			res.writeHead(200, { "Content-Type": "text/event-stream" });
+			res.write("data: open\n\n");
+			req.on("close", () => upstreamClosed.push(req.url!));
+		},
+	});
+	try {
+		const tokenA = await pairedToken(h);
+		const tokenB = await pairedToken(h);
+		const idA = (await (await fetch(`${h.base}/phone/v1/ping`, { headers: { authorization: `Bearer ${tokenA}` } })).json()).deviceId;
+		const open = async (token: string, p: string) => {
+			const res = await fetch(`${h.base}${p}`, { headers: { authorization: `Bearer ${token}` } });
+			const reader = res.body!.getReader();
+			await reader.read(); // the first event arrived: the stream is open
+			return reader;
+		};
+		const events = await open(tokenA, "/api/events");
+		const turn = await open(tokenA, "/api/chats/chat_1/stream");
+		const other = await open(tokenB, "/api/events?b=1");
+
+		h.gateway.revoke(idA);
+
+		const ended = (reader: ReadableStreamDefaultReader<Uint8Array>) =>
+			Promise.race([
+				reader.read().then((r) => r.done, () => true),
+				new Promise<boolean>((resolve) => setTimeout(() => resolve(false), 2000)),
+			]);
+		assert.equal(await ended(events), true, "the event stream closed on the phone side");
+		assert.equal(await ended(turn), true, "the turn stream closed on the phone side");
+		await new Promise((r) => setTimeout(r, 100));
+		assert.deepEqual(upstreamClosed.sort(), ["/api/chats/chat_1/stream", "/api/events"], "both upstream requests closed");
+		// The other device's stream stays open.
+		const stillOpen = await Promise.race([other.read().then(() => "data"), new Promise((r) => setTimeout(() => r("open"), 200))]);
+		assert.equal(stillOpen, "open");
+		await other.cancel();
 	} finally {
 		await h.close();
 	}

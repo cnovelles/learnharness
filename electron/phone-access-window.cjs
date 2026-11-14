@@ -31,7 +31,12 @@ function createPhoneAccess({ electron, file, target, info, log }) {
 		if (win && !win.isDestroyed()) win.webContents.send("lh:phone:paired", { name: device.name });
 		push();
 	};
-	const gateway = createPhoneGateway({ store, target, info, log, onPaired });
+	// Wrong codes cancelled the active code: the QR code on screen is dead.
+	const onPairingCancelled = () => {
+		currentPayload = null;
+		if (win && !win.isDestroyed()) win.webContents.send("lh:phone:pair-cancelled");
+	};
+	const gateway = createPhoneGateway({ store, target, info, log, onPaired, onPairingCancelled });
 	let lastError = null;
 	// The current pairing payload. Only main keeps it: "Copy pairing text"
 	// writes it to the clipboard, so the window page never holds the code.
