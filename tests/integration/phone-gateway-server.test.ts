@@ -1,9 +1,9 @@
 /**
- * Integration (mobile fork, issue 01): the phone gateway in front of the
+ * Integration (mobile fork, issues 01 and 01b): the phone gateway in front of the
  * REAL upstream server, with the fake OpenAI-compatible provider as the
  * only model.
  *
- *   fake provider (loopback) ← next dev (temp LH_DATA_DIR) ← gateway ← "phone" (fetch)
+ *   fake provider (loopback) ← next dev (temp LH_DATA_DIR) ← gateway (HTTPS) ← "phone" (pinned fetch)
  *
  * Run: npm run test:phone-integration
  * It boots `next dev`, so it is not part of `npm test`. Stop any
@@ -12,15 +12,18 @@
 import assert from "node:assert/strict";
 import { createRequire } from "node:module";
 import fs from "node:fs";
+import https from "node:https";
 import path from "node:path";
 import type { AddressInfo } from "node:net";
 import { after, before, describe, it } from "node:test";
 import { startFakeProvider, type FakeProvider, type FakeRequest } from "../helpers/fake-openai-provider.ts";
 import { startDevServer, type DevServer } from "../helpers/next-dev-server.ts";
+import { PinMismatchError, pinnedFetch, type PinnedFetch } from "../helpers/pinned-fetch.ts";
 import { buildAnswer, questionDataForCall } from "../../src/core/question-core.ts";
 
 const require = createRequire(import.meta.url);
 const { createPhoneAccessStore, createPhoneGateway } = require("../../electron/phone-access.cjs");
+const { createCertificate, spkiPin } = require("../../electron/phone-access-tls.cjs");
 
 /** The per-launch desktop capability, as electron/main.cjs makes it. */
 const SECRET = "d".repeat(64);
@@ -58,13 +61,15 @@ let fake: FakeProvider;
 let server: DevServer;
 let gateway: ReturnType<typeof createPhoneGateway>;
 let gatewayURL = "";
+/** The phone's fetch: pinned to the pin from the pairing payload. */
+let phone: PinnedFetch;
 let token = "";
 let deviceId = "";
 let storeFile = "";
 
 const phoneHeaders = (extra: Record<string, string> = {}) => ({ authorization: `Bearer ${token}`, ...extra });
 const phoneFetch = (p: string, init: RequestInit = {}) =>
-	fetch(`${gatewayURL}${p}`, { ...init, headers: { ...phoneHeaders(), ...(init.headers as Record<string, string> | undefined) } });
+	phone(`${gatewayURL}${p}`, { ...init, headers: { ...phoneHeaders(), ...(init.headers as Record<string, string> | undefined) } });
 const phoneJSON = async (p: string, method = "GET", body?: unknown) => {
 	const res = await phoneFetch(p, { method, ...(body === undefined ? {} : { headers: { "content-type": "application/json" }, body: JSON.stringify(body) }) });
 	const text = await res.text();
@@ -175,13 +180,15 @@ before(async () => {
 	gateway = createPhoneGateway({
 		store: createPhoneAccessStore(storeFile),
 		target: () => ({ url: server.url, secret: SECRET }),
+		tlsDir: path.join(server.home, "phone-access-tls"),
 		info: { name: "Test Mac", version: "test" },
 	});
 	const address: AddressInfo = await gateway.start({ host: "127.0.0.1", port: 0 });
-	gatewayURL = `http://127.0.0.1:${address.port}`;
+	gatewayURL = `https://127.0.0.1:${address.port}`;
 });
 
 after(async () => {
+	await phone?.close();
 	await gateway?.stop();
 	await server?.stop();
 	await fake?.close();
@@ -190,12 +197,14 @@ after(async () => {
 describe("phone gateway in front of the real server", { concurrency: false }, () => {
 	it("pairs with a one-use code and pings", async () => {
 		const { code } = gateway.startPairing();
-		const pair = await fetch(`${gatewayURL}/phone/v1/pair`, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ code, deviceName: "Test iPhone" }) });
+		const payload = JSON.parse(gateway.pairingPayload(code));
+		phone = pinnedFetch(payload.pin);
+		const pair = await phone(`${gatewayURL}/phone/v1/pair`, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ code, deviceName: "Test iPhone" }) });
 		assert.equal(pair.status, 200);
 		const paired = await pair.json();
 		token = paired.token;
 		deviceId = paired.deviceId;
-		const again = await fetch(`${gatewayURL}/phone/v1/pair`, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ code }) });
+		const again = await phone(`${gatewayURL}/phone/v1/pair`, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ code }) });
 		assert.equal(again.status, 401, "the code works once");
 		const ping = await phoneJSON("/phone/v1/ping");
 		assert.equal(ping.status, 200);
@@ -348,6 +357,27 @@ describe("phone gateway in front of the real server", { concurrency: false }, ()
 		const done = await readSSE(await phoneFetch(`/api/chats/${created.body.id}/stream`), isDone, 60_000);
 		assert.equal(latestText(done.frames), PRACTICE_TEXT, diag(done.frames));
 		assert.ok(fake.requests.some((r) => r.role === "practitioner"));
+	});
+
+	it("the phone sends nothing to a server with a wrong certificate", async () => {
+		// An impostor at a saved address (another network, same IP).
+		const seen: string[] = [];
+		const impostor = https.createServer(createCertificate(), (req, res) => {
+			seen.push(`${req.method} ${req.url} ${req.headers.authorization ?? ""}`);
+			res.end("{}");
+		});
+		await new Promise<void>((r) => impostor.listen(0, "127.0.0.1", r));
+		try {
+			const url = `https://127.0.0.1:${(impostor.address() as AddressInfo).port}`;
+			await assert.rejects(phone(`${url}/phone/v1/ping`, { headers: phoneHeaders() }), (err: any) => err.cause instanceof PinMismatchError);
+			await assert.rejects(phone(`${url}/api/chats`, { headers: phoneHeaders() }), (err: any) => err.cause instanceof PinMismatchError);
+			assert.deepEqual(seen, [], "the impostor got no request and no token");
+		} finally {
+			await new Promise<void>((r) => impostor.close(() => r()));
+		}
+		// The real gateway still passes the pin.
+		assert.equal((await phoneJSON("/phone/v1/ping")).status, 200);
+		assert.equal(spkiPin(fs.readFileSync(path.join(server.home, "phone-access-tls", "cert.pem"))), gateway.pin());
 	});
 
 	it("a removed device gets 401 at once", async () => {

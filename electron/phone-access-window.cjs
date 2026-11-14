@@ -20,7 +20,7 @@ const { createPhoneAccessStore, createPhoneGateway, reachableAddresses } = requi
 
 /** `electron` is injected by main.cjs (its own module objects), so test
  * harnesses that fake Electron also fake this window. */
-function createPhoneAccess({ electron, file, target, info, log }) {
+function createPhoneAccess({ electron, file, tlsDir, target, info, log }) {
 	const { BrowserWindow, ipcMain, shell, clipboard } = electron;
 	const store = createPhoneAccessStore(file);
 	let win = null;
@@ -36,7 +36,7 @@ function createPhoneAccess({ electron, file, target, info, log }) {
 		currentPayload = null;
 		if (win && !win.isDestroyed()) win.webContents.send("lh:phone:pair-cancelled");
 	};
-	const gateway = createPhoneGateway({ store, target, info, log, onPaired, onPairingCancelled });
+	const gateway = createPhoneGateway({ store, target, tlsDir, info, log, onPaired, onPairingCancelled });
 	let lastError = null;
 	// The current pairing payload. Only main keeps it: "Copy pairing text"
 	// writes it to the clipboard, so the window page never holds the code.
@@ -49,7 +49,7 @@ function createPhoneAccess({ electron, file, target, info, log }) {
 			running: gateway.running(),
 			port: state.port,
 			error: lastError,
-			addresses: reachableAddresses().map((a) => ({ ...a, url: `http://${a.address}:${state.port}` })),
+			addresses: reachableAddresses().map((a) => ({ ...a, url: `https://${a.address}:${state.port}` })),
 			devices: state.devices.map(({ id, name, createdAt, lastSeenAt }) => ({ id, name, createdAt, lastSeenAt })),
 		};
 	}

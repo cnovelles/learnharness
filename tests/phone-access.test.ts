@@ -1,14 +1,18 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { createRequire } from "node:module";
+import crypto from "node:crypto";
 import fs from "node:fs";
 import http from "node:http";
 import os from "node:os";
 import path from "node:path";
 import type { AddressInfo } from "node:net";
+import { PinMismatchError, pinnedFetch } from "./helpers/pinned-fetch.ts";
 
 const require = createRequire(import.meta.url);
-const { createPhoneAccessStore, createPhoneGateway, phoneRouteAllowed, reachableAddresses, hashToken, PAIRING_TTL_MS } = require("../electron/phone-access.cjs");
+const { createPhoneAccessStore, createPhoneGateway, phoneRouteAllowed, reachableAddresses, hashToken, PAIRING_TTL_MS, PROTOCOL } = require("../electron/phone-access.cjs");
+const { createCertificate, loadOrCreateCertificate, spkiPin, checkPair } = require("../electron/phone-access-tls.cjs");
+
 
 const SECRET = "s".repeat(64);
 
@@ -113,17 +117,21 @@ async function harness(options: { now?: () => number; upstream?: http.RequestLis
 	}));
 	await new Promise<void>((r) => upstream.listen(0, "127.0.0.1", r));
 	const upstreamURL = `http://127.0.0.1:${(upstream.address() as AddressInfo).port}`;
-	const store = createPhoneAccessStore(tempFile());
+	const storeFile = tempFile();
+	const store = createPhoneAccessStore(storeFile);
 	const paired: Array<{ id: string; name: string }> = [];
-	const gateway = createPhoneGateway({ store, target: () => ({ url: upstreamURL, secret: SECRET }), info: { name: "test-mac", version: "0.0.0" }, now: options.now, onPaired: (d: { id: string; name: string }) => paired.push(d), onPairingCancelled: options.onPairingCancelled });
+	const tlsDir = path.join(path.dirname(storeFile), "tls");
+	const gateway = createPhoneGateway({ store, tlsDir, target: () => ({ url: upstreamURL, secret: SECRET }), info: { name: "test-mac", version: "0.0.0" }, now: options.now, onPaired: (d: { id: string; name: string }) => paired.push(d), onPairingCancelled: options.onPairingCancelled });
 	const addr = await gateway.start({ host: "127.0.0.1", port: 0 });
-	const base = `http://127.0.0.1:${addr.port}`;
+	const base = `https://127.0.0.1:${addr.port}`;
+	const fetch = pinnedFetch(gateway.pin());
 	const close = async () => {
+		await fetch.close();
 		await gateway.stop();
 		await new Promise<void>((r) => upstream.close(() => r()));
 	};
 	const pair = async (code: string) => fetch(`${base}/phone/v1/pair`, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ code, deviceName: "iPhone" }) });
-	return { seen, store, gateway, base, close, pair, upstream, paired };
+	return { seen, store, tlsDir, gateway, base, close, pair, upstream, paired, fetch };
 }
 
 test("pairing: one use, no code without a session, wrong code refused", async () => {
@@ -197,7 +205,7 @@ test("requests without a valid token are refused and never reach the server", as
 	const h = await harness();
 	try {
 		for (const auth of [undefined, "Bearer short", "Bearer " + "x".repeat(43), "Basic abc"]) {
-			const res = await fetch(`${h.base}/api/chats`, { headers: auth ? { authorization: auth } : {} });
+			const res = await h.fetch(`${h.base}/api/chats`, { headers: auth ? { authorization: auth } : {} });
 			assert.equal(res.status, 401, String(auth));
 		}
 		assert.equal(h.seen.length, 0);
@@ -215,7 +223,7 @@ test("allowed requests reach the server with the desktop secret and without phon
 	const h = await harness();
 	try {
 		const token = await pairedToken(h);
-		const res = await fetch(`${h.base}/api/chat?x=1`, {
+		const res = await h.fetch(`${h.base}/api/chat?x=1`, {
 			method: "POST",
 			headers: { authorization: `Bearer ${token}`, "content-type": "application/json", cookie: "evil=1", origin: "https://evil.invalid", "x-learnharness-desktop": "forged" },
 			body: JSON.stringify({ chatId: "chat_1", input: { type: "text", text: "hi" } }),
@@ -240,7 +248,7 @@ test("refused routes return 403 and never reach the server", async () => {
 	const h = await harness();
 	try {
 		const token = await pairedToken(h);
-		const res = await fetch(`${h.base}/api/keys`, { headers: { authorization: `Bearer ${token}` } });
+		const res = await h.fetch(`${h.base}/api/keys`, { headers: { authorization: `Bearer ${token}` } });
 		assert.equal(res.status, 403);
 		assert.equal(h.seen.length, 0);
 	} finally {
@@ -252,11 +260,11 @@ test("ping answers a paired phone; a revoked phone is refused", async () => {
 	const h = await harness();
 	try {
 		const token = await pairedToken(h);
-		const ping = await fetch(`${h.base}/phone/v1/ping`, { headers: { authorization: `Bearer ${token}` } });
+		const ping = await h.fetch(`${h.base}/phone/v1/ping`, { headers: { authorization: `Bearer ${token}` } });
 		assert.equal(ping.status, 200);
 		const { deviceId } = await ping.json();
 		h.gateway.revoke(deviceId);
-		assert.equal((await fetch(`${h.base}/phone/v1/ping`, { headers: { authorization: `Bearer ${token}` } })).status, 401);
+		assert.equal((await h.fetch(`${h.base}/phone/v1/ping`, { headers: { authorization: `Bearer ${token}` } })).status, 401);
 	} finally {
 		await h.close();
 	}
@@ -273,7 +281,7 @@ test("server-sent events stream through chunk by chunk", async () => {
 	});
 	try {
 		const token = await pairedToken(h);
-		const res = await fetch(`${h.base}/api/chats/chat_1/stream`, { headers: { authorization: `Bearer ${token}` } });
+		const res = await h.fetch(`${h.base}/api/chats/chat_1/stream`, { headers: { authorization: `Bearer ${token}` } });
 		const reader = res.body!.getReader();
 		const first = new TextDecoder().decode((await reader.read()).value);
 		assert.equal(first, "data: first\n\n", "first event arrives before the upstream ends");
@@ -303,7 +311,7 @@ test("a phone that disconnects closes the upstream request", async () => {
 	try {
 		const token = await pairedToken(h);
 		const controller = new AbortController();
-		const res = await fetch(`${h.base}/api/events`, { headers: { authorization: `Bearer ${token}` }, signal: controller.signal });
+		const res = await h.fetch(`${h.base}/api/events`, { headers: { authorization: `Bearer ${token}` }, signal: controller.signal });
 		await res.body!.getReader().read();
 		controller.abort();
 		await Promise.race([closed, new Promise((_, rej) => setTimeout(() => rej(new Error("upstream not closed")), 2000))]);
@@ -324,9 +332,9 @@ test("revoke closes the device's open streams on both sides; other devices keep 
 	try {
 		const tokenA = await pairedToken(h);
 		const tokenB = await pairedToken(h);
-		const idA = (await (await fetch(`${h.base}/phone/v1/ping`, { headers: { authorization: `Bearer ${tokenA}` } })).json()).deviceId;
+		const idA = (await (await h.fetch(`${h.base}/phone/v1/ping`, { headers: { authorization: `Bearer ${tokenA}` } })).json()).deviceId;
 		const open = async (token: string, p: string) => {
-			const res = await fetch(`${h.base}${p}`, { headers: { authorization: `Bearer ${token}` } });
+			const res = await h.fetch(`${h.base}${p}`, { headers: { authorization: `Bearer ${token}` } });
 			const reader = res.body!.getReader();
 			await reader.read(); // the first event arrived: the stream is open
 			return reader;
@@ -360,9 +368,104 @@ test("an unreachable server gives 502", async () => {
 	try {
 		const token = await pairedToken(h);
 		await new Promise<void>((r) => h.upstream.close(() => r()));
-		const res = await fetch(`${h.base}/api/chats`, { headers: { authorization: `Bearer ${token}` } });
+		const res = await h.fetch(`${h.base}/api/chats`, { headers: { authorization: `Bearer ${token}` } });
 		assert.equal(res.status, 502);
 	} finally {
 		await h.gateway.stop();
+	}
+});
+
+// ─── TLS: certificate, pin, HTTPS only ───────────────────────────────────
+
+test("the certificate is a valid self-signed P-256 certificate, and the pin is the SPKI SHA-256", () => {
+	const { key, cert } = createCertificate();
+	const x509 = new crypto.X509Certificate(cert);
+	assert.equal(x509.subject, "CN=LearnHarness Phone Access");
+	assert.equal(x509.issuer, x509.subject);
+	assert.equal(x509.ca, false);
+	assert.ok(x509.verify(x509.publicKey), "self-signed signature is valid");
+	assert.ok(new Date(x509.validTo).getTime() > Date.now() + 10 * 365 * 24 * 3600 * 1000);
+	const spki = crypto.createPublicKey(key).export({ type: "spki", format: "der" });
+	assert.equal(spkiPin(cert), `sha256/${crypto.createHash("sha256").update(spki).digest("base64")}`);
+	assert.throws(() => checkPair(createCertificate().key, cert), /does not match/);
+});
+
+test("the key file is private, a restart keeps the pin, a damaged pair makes a new one", () => {
+	const dir = path.join(fs.mkdtempSync(path.join(os.tmpdir(), "lh-phone-tls-")), "tls");
+	const first = loadOrCreateCertificate(dir);
+	assert.equal(first.created, true);
+	assert.equal(fs.statSync(path.join(dir, "key.pem")).mode & 0o777, 0o600);
+	const again = loadOrCreateCertificate(dir);
+	assert.equal(again.created, false);
+	assert.equal(again.pin, first.pin);
+	fs.writeFileSync(path.join(dir, "cert.pem"), "damaged");
+	const logs: string[] = [];
+	const rotated = loadOrCreateCertificate(dir, { log: (l: string) => logs.push(l) });
+	assert.equal(rotated.created, true);
+	assert.notEqual(rotated.pin, first.pin);
+	assert.match(logs.join("\n"), /not usable/);
+});
+
+test("the gateway serves HTTPS only; the pairing payload has the pin and https addresses", async () => {
+	const h = await harness();
+	try {
+		assert.equal(PROTOCOL, 2);
+		const port = new URL(h.base).port;
+		await assert.rejects(fetch(`http://127.0.0.1:${port}/phone/v1/ping`), "no plain HTTP answer");
+		const { code } = h.gateway.startPairing();
+		const payload = JSON.parse(h.gateway.pairingPayload(code));
+		assert.equal(payload.lh, 2);
+		assert.equal(payload.pin, h.gateway.pin());
+		assert.match(payload.pin, /^sha256\/[A-Za-z0-9+/]{43}=$/);
+		for (const url of payload.urls) assert.match(url, /^https:\/\//);
+		assert.equal(spkiPin(fs.readFileSync(path.join(h.tlsDir, "cert.pem"))), payload.pin);
+	} finally {
+		await h.close();
+	}
+});
+
+test("a client with a wrong pin sends nothing: the code and the server stay untouched", async () => {
+	const h = await harness();
+	const wrong = pinnedFetch(spkiPin(createCertificate().cert));
+	try {
+		const { code } = h.gateway.startPairing();
+		await assert.rejects(
+			wrong(`${h.base}/phone/v1/pair`, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ code }) }),
+			(err: any) => err.cause instanceof PinMismatchError,
+		);
+		assert.deepEqual(wrong.checks.map((c) => c.ok), [false]);
+		// The gateway saw no request: the code still works, and it counts no failure.
+		assert.equal((await h.pair(code)).status, 200);
+		assert.equal(h.seen.length, 0);
+	} finally {
+		await wrong.close();
+		await h.close();
+	}
+});
+
+test("a new certificate removes the paired phones; they must pair again", async () => {
+	const h = await harness();
+	try {
+		const token = await pairedToken(h);
+		const oldPin = h.gateway.pin();
+		await h.gateway.stop();
+		// A restart with the same files keeps the phone.
+		await h.gateway.start({ host: "127.0.0.1", port: 0 });
+		assert.equal(h.gateway.pin(), oldPin);
+		assert.equal(h.store.read().devices.length, 1);
+		await h.gateway.stop();
+		// Lost key: a new certificate, a new pin, no paired phones.
+		fs.rmSync(path.join(h.tlsDir, "key.pem"));
+		const addr = await h.gateway.start({ host: "127.0.0.1", port: 0 });
+		assert.notEqual(h.gateway.pin(), oldPin);
+		assert.deepEqual(h.store.read().devices, []);
+		const oldPhone = pinnedFetch(oldPin);
+		await assert.rejects(oldPhone(`https://127.0.0.1:${addr.port}/phone/v1/ping`, { headers: { authorization: `Bearer ${token}` } }), (err: any) => err.cause instanceof PinMismatchError);
+		await oldPhone.close();
+		const newPhone = pinnedFetch(h.gateway.pin());
+		assert.equal((await newPhone(`https://127.0.0.1:${addr.port}/phone/v1/ping`, { headers: { authorization: `Bearer ${token}` } })).status, 401, "the old token is gone");
+		await newPhone.close();
+	} finally {
+		await h.close();
 	}
 });
