@@ -163,3 +163,17 @@ test("a phone that pairs makes the window drop the spent code and list the devic
 	assert.deepEqual(await call("lh:phone:copy-pairing"), { error: "Show a new QR code first." }, "the spent payload is gone");
 	await access.stop();
 });
+
+test("wrong codes that cancel the code make the window drop the dead QR code", async () => {
+	const { call, fake, access } = setup();
+	await call("lh:phone:set-enabled", true);
+	await call("lh:phone:pair");
+	fake.sent.length = 0;
+	const port = access.gateway.address().port;
+	for (let i = 0; i < 10; i++) {
+		await fetch(`http://127.0.0.1:${port}/phone/v1/pair`, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ code: `wrong-${i}` }) });
+	}
+	assert.ok(fake.sent.some((m) => m.channel === "lh:phone:pair-cancelled"));
+	assert.deepEqual(await call("lh:phone:copy-pairing"), { error: "Show a new QR code first." });
+	await access.stop();
+});

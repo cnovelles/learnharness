@@ -132,6 +132,11 @@ $("copyPairing").addEventListener("click", async () => {
 	setTimeout(() => text($("copyPairing"), "Copy pairing text"), 2000);
 });
 api.onChanged(render);
+api.onPairCancelled(() => {
+	hidePair();
+	$("pairResult").hidden = false;
+	text($("pairResult"), "Someone entered too many wrong codes, so the code was cancelled. Show a new QR code.");
+});
 api.onPaired((device) => {
 	hidePair();
 	$("pairResult").hidden = false;

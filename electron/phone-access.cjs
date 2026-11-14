@@ -26,8 +26,8 @@ const STORE_VERSION = 1;
 const DEFAULT_PORT = 47821;
 const PAIRING_TTL_MS = 5 * 60 * 1000;
 const MAX_BODY_BYTES = 26 * 1024 * 1024;
+/** Wrong codes allowed against one pairing code. The next one cancels that code. */
 const FAILED_PAIR_LIMIT = 10;
-const FAILED_PAIR_WINDOW_MS = 60 * 1000;
 const LAST_SEEN_SAVE_MS = 60 * 1000;
 const DESKTOP_HEADER = "x-learnharness-desktop";
 const PROTOCOL = 1;
@@ -159,17 +159,22 @@ const HOP_HEADERS = new Set(["connection", "keep-alive", "transfer-encoding", "u
  * @param {(line: string) => void} [options.log]
  * @param {() => number} [options.now]
  * @param {(device: {id: string, name: string}) => void} [options.onPaired] called after a phone pairs
+ * @param {(reason: "too-many-attempts") => void} [options.onPairingCancelled] called when wrong codes cancel the active code
  */
-function createPhoneGateway({ store, target, info = {}, log = () => {}, now = () => Date.now(), onPaired = () => {} }) {
+function createPhoneGateway({ store, target, info = {}, log = () => {}, now = () => Date.now(), onPaired = () => {}, onPairingCancelled = () => {} }) {
 	let server = null;
-	let pairing = null; // {codeHash, expiresAt}
-	const failedPairs = [];
+	// The active one-use code. `failures` counts wrong codes against THIS code
+	// only: a device on the network can cancel a code, but it cannot block the
+	// next one (a new code starts at zero).
+	let pairing = null; // {codeHash, expiresAt, failures}
 	const lastSeenSaved = new Map();
 	const sockets = new Set();
+	// Open proxied requests by device id, so a revoke closes them at once.
+	const activeByDevice = new Map(); // deviceId -> Set<{res, upstream}>
 
 	function startPairing() {
 		const code = randomToken(18);
-		pairing = { codeHash: hashToken(code), expiresAt: now() + PAIRING_TTL_MS };
+		pairing = { codeHash: hashToken(code), expiresAt: now() + PAIRING_TTL_MS, failures: 0 };
 		return { code, expiresAt: pairing.expiresAt };
 	}
 
@@ -203,8 +208,6 @@ function createPhoneGateway({ store, target, info = {}, log = () => {}, now = ()
 
 	async function handlePair(req, res) {
 		const t = now();
-		while (failedPairs.length && t - failedPairs[0] > FAILED_PAIR_WINDOW_MS) failedPairs.shift();
-		if (failedPairs.length >= FAILED_PAIR_LIMIT) return sendJSON(res, 429, { error: "Too many pairing attempts. Wait one minute." });
 		let body;
 		try {
 			body = await readJSONBody(req);
@@ -214,7 +217,18 @@ function createPhoneGateway({ store, target, info = {}, log = () => {}, now = ()
 		const code = typeof body.code === "string" ? body.code : "";
 		const valid = pairing && t <= pairing.expiresAt && code.length > 0 && safeEqualHex(pairing.codeHash, hashToken(code));
 		if (!valid) {
-			failedPairs.push(t);
+			if (pairing && t <= pairing.expiresAt) {
+				pairing.failures += 1;
+				if (pairing.failures >= FAILED_PAIR_LIMIT) {
+					pairing = null;
+					log("phone access: pairing code cancelled after too many wrong codes");
+					try {
+						onPairingCancelled("too-many-attempts");
+					} catch (err) {
+						log(`phone access: onPairingCancelled failed: ${err.message}`);
+					}
+				}
+			}
 			return sendJSON(res, 401, { error: "The pairing code is not valid or has expired. Show a new QR code on the Mac." });
 		}
 		pairing = null; // one use
@@ -236,7 +250,17 @@ function createPhoneGateway({ store, target, info = {}, log = () => {}, now = ()
 		sendJSON(res, 200, { token, deviceId: device.id, protocol: PROTOCOL, server: { name: info.name ?? os.hostname(), version: info.version ?? null } });
 	}
 
-	function proxy(req, res, url) {
+	function track(deviceId, entry) {
+		let set = activeByDevice.get(deviceId);
+		if (!set) activeByDevice.set(deviceId, (set = new Set()));
+		set.add(entry);
+		return () => {
+			set.delete(entry);
+			if (set.size === 0 && activeByDevice.get(deviceId) === set) activeByDevice.delete(deviceId);
+		};
+	}
+
+	function proxy(req, res, url, device) {
 		const { url: base, secret } = target();
 		const upstreamURL = new URL(url.pathname + url.search, base);
 		const headers = {};
@@ -258,8 +282,10 @@ function createPhoneGateway({ store, target, info = {}, log = () => {}, now = ()
 			if (!res.headersSent) sendJSON(res, 502, { error: "The LearnHarness server is not reachable." });
 			else res.destroy();
 		});
+		const untrack = track(device.id, { res, upstream });
 		// A phone that disconnects detaches its view, like a closed browser tab.
 		res.on("close", () => {
+			untrack();
 			if (!res.writableFinished) upstream.destroy();
 		});
 		let size = 0;
@@ -288,7 +314,7 @@ function createPhoneGateway({ store, target, info = {}, log = () => {}, now = ()
 			return sendJSON(res, 200, { ok: true, protocol: PROTOCOL, deviceId: device.id, server: { name: info.name ?? os.hostname(), version: info.version ?? null } });
 		}
 		if (!phoneRouteAllowed(req.method ?? "GET", url.pathname)) return sendJSON(res, 403, { error: "This action is available only on the desktop." });
-		proxy(req, res, url);
+		proxy(req, res, url, device);
 	}
 
 	function start({ host = "0.0.0.0", port } = {}) {
@@ -325,7 +351,16 @@ function createPhoneGateway({ store, target, info = {}, log = () => {}, now = ()
 
 	function revoke(deviceId) {
 		store.update((state) => ({ ...state, devices: state.devices.filter((d) => d.id !== deviceId) }));
-		log(`phone access: revoked ${deviceId}`);
+		// Close what the device still has open (event and turn streams), on
+		// both sides. Its token already fails every new request.
+		const open = activeByDevice.get(deviceId);
+		activeByDevice.delete(deviceId);
+		for (const { res, upstream } of open ?? []) {
+			upstream.destroy();
+			res.destroy();
+		}
+		lastSeenSaved.delete(deviceId);
+		log(`phone access: revoked ${deviceId}${open?.size ? ` and closed ${open.size} open request(s)` : ""}`);
 	}
 
 	return { start, stop, startPairing, cancelPairing, pairingPayload, revoke, running: () => server !== null, address: () => server?.address() ?? null };
