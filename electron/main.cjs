@@ -761,6 +761,7 @@ async function main() {
 	phoneAccess = createPhoneAccess({
 		electron: { BrowserWindow, ipcMain, shell, clipboard },
 		file: path.join(app.getPath("userData"), "phone-access.json"),
+		tlsDir: path.join(app.getPath("userData"), "phone-access-tls"),
 		target: () => ({ url, secret: desktopAPISecret }),
 		info: { name: require("node:os").hostname(), version: app.getVersion() },
 		log,

@@ -5,7 +5,10 @@
  * this desktop app's server while the desktop window stays open.
  *
  * What it is:
- *  - An HTTP gateway on a fixed port (all interfaces, so LAN and Tailscale).
+ *  - An HTTPS gateway on a fixed port (all interfaces, so LAN and Tailscale).
+ *    No plain HTTP listener. The certificate is self-signed
+ *    (phone-access-tls.cjs); the phone pins its public key, which it gets
+ *    from the pairing QR code, and sends nothing to a server that fails it.
  *  - Each request must carry a device token from QR pairing.
  *  - Only an allowlist of chat/graph routes passes. Keys, subscriptions,
  *    providers, prompts and settings writes stay desktop-only.
@@ -13,14 +16,16 @@
  *    capability header added here. The server code is unchanged.
  *
  * What it is not: a public-internet host. Use Tailscale outside the home
- * network; plain LAN HTTP is not encrypted.
+ * network.
  */
 
 const crypto = require("node:crypto");
 const fs = require("node:fs");
 const http = require("node:http");
+const https = require("node:https");
 const os = require("node:os");
 const path = require("node:path");
+const { loadOrCreateCertificate } = require("./phone-access-tls.cjs");
 
 const STORE_VERSION = 1;
 const DEFAULT_PORT = 47821;
@@ -30,7 +35,8 @@ const MAX_BODY_BYTES = 26 * 1024 * 1024;
 const FAILED_PAIR_LIMIT = 10;
 const LAST_SEEN_SAVE_MS = 60 * 1000;
 const DESKTOP_HEADER = "x-learnharness-desktop";
-const PROTOCOL = 1;
+/** 2: HTTPS with the SPKI pin in the pairing payload (1 was plain HTTP). */
+const PROTOCOL = 2;
 
 /** Method + path allowlist. Anything not listed is refused with 403. */
 const ROUTES = [
@@ -155,14 +161,16 @@ const HOP_HEADERS = new Set(["connection", "keep-alive", "transfer-encoding", "u
  * @param {object} options
  * @param {ReturnType<typeof createPhoneAccessStore>} options.store
  * @param {() => {url: string, secret?: string}} options.target loopback server URL + desktop secret
+ * @param {string} options.tlsDir folder for the gateway key and certificate (userData)
  * @param {{name?: string, version?: string}} [options.info]
  * @param {(line: string) => void} [options.log]
  * @param {() => number} [options.now]
  * @param {(device: {id: string, name: string}) => void} [options.onPaired] called after a phone pairs
  * @param {(reason: "too-many-attempts") => void} [options.onPairingCancelled] called when wrong codes cancel the active code
  */
-function createPhoneGateway({ store, target, info = {}, log = () => {}, now = () => Date.now(), onPaired = () => {}, onPairingCancelled = () => {} }) {
+function createPhoneGateway({ store, target, tlsDir, info = {}, log = () => {}, now = () => Date.now(), onPaired = () => {}, onPairingCancelled = () => {} }) {
 	let server = null;
+	let certificate = null; // {key, cert, pin}, loaded by start()
 	// The active one-use code. `failures` counts wrong codes against THIS code
 	// only: a device on the network can cancel a code, but it cannot block the
 	// next one (a new code starts at zero).
@@ -182,9 +190,26 @@ function createPhoneGateway({ store, target, info = {}, log = () => {}, now = ()
 		pairing = null;
 	}
 
+	/** The pairing payload (QR code and "Copy pairing text"). Needs a started gateway (the pin). */
 	function pairingPayload(code, port = store.read().port) {
-		const urls = reachableAddresses().map((a) => `http://${a.address}:${port}`);
-		return JSON.stringify({ lh: PROTOCOL, name: info.name ?? os.hostname(), urls, code });
+		if (!certificate) throw new Error("phone access: start the gateway before pairing");
+		const urls = reachableAddresses().map((a) => `https://${a.address}:${port}`);
+		return JSON.stringify({ lh: PROTOCOL, name: info.name ?? os.hostname(), urls, pin: certificate.pin, code });
+	}
+
+	/** Load the certificate, or make one. A new key has a new pin: the
+	 * paired phones cannot connect any more, so they must pair again. */
+	function loadCertificate() {
+		if (typeof tlsDir !== "string" || !tlsDir) throw new Error("phone access: tlsDir is missing");
+		const loaded = loadOrCreateCertificate(tlsDir, { log });
+		if (loaded.created) {
+			const before = store.read().devices.length;
+			if (before > 0) {
+				store.update((state) => ({ ...state, devices: [] }));
+				log(`phone access: new certificate; removed ${before} paired phone(s), which must pair again`);
+			}
+		}
+		certificate = { key: loaded.key, cert: loaded.cert, pin: loaded.pin };
 	}
 
 	function authenticate(req) {
@@ -320,13 +345,19 @@ function createPhoneGateway({ store, target, info = {}, log = () => {}, now = ()
 	function start({ host = "0.0.0.0", port } = {}) {
 		if (server) return Promise.resolve(server.address());
 		const listenPort = port ?? store.read().port ?? DEFAULT_PORT;
+		try {
+			loadCertificate();
+		} catch (err) {
+			return Promise.reject(err);
+		}
 		return new Promise((resolve, reject) => {
-			const srv = http.createServer((req, res) => {
+			const srv = https.createServer({ key: certificate.key, cert: certificate.cert, minVersion: "TLSv1.2" }, (req, res) => {
 				handle(req, res).catch((err) => {
 					log(`phone access: ${err.stack ?? err}`);
 					if (!res.headersSent) sendJSON(res, 500, { error: "Internal error." });
 				});
 			});
+			srv.on("tlsClientError", (err) => log(`phone access: TLS handshake failed: ${err.code ?? err.message}`));
 			srv.on("connection", (socket) => {
 				sockets.add(socket);
 				socket.on("close", () => sockets.delete(socket));
@@ -334,7 +365,7 @@ function createPhoneGateway({ store, target, info = {}, log = () => {}, now = ()
 			srv.once("error", reject);
 			srv.listen(listenPort, host, () => {
 				server = srv;
-				log(`phone access: listening on ${host}:${srv.address().port}`);
+				log(`phone access: listening (HTTPS) on ${host}:${srv.address().port}`);
 				resolve(srv.address());
 			});
 		});
@@ -363,7 +394,7 @@ function createPhoneGateway({ store, target, info = {}, log = () => {}, now = ()
 		log(`phone access: revoked ${deviceId}${open?.size ? ` and closed ${open.size} open request(s)` : ""}`);
 	}
 
-	return { start, stop, startPairing, cancelPairing, pairingPayload, revoke, running: () => server !== null, address: () => server?.address() ?? null };
+	return { start, stop, startPairing, cancelPairing, pairingPayload, revoke, running: () => server !== null, address: () => server?.address() ?? null, pin: () => certificate?.pin ?? null };
 }
 
 module.exports = {

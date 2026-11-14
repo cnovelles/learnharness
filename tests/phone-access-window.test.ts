@@ -10,6 +10,7 @@ import { createRequire } from "node:module";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
+import { pinnedFetch } from "./helpers/pinned-fetch.ts";
 
 const require = createRequire(import.meta.url);
 const { createPhoneAccess } = require("../electron/phone-access-window.cjs");
@@ -61,6 +62,7 @@ function setup() {
 	const access = createPhoneAccess({
 		electron: fake.electron,
 		file: path.join(dir, "phone-access.json"),
+		tlsDir: path.join(dir, "tls"),
 		target: () => ({ url: "http://127.0.0.1:1" }),
 		info: { name: "Test Mac", version: "test" },
 		log: () => {},
@@ -69,7 +71,15 @@ function setup() {
 	access.store.update((s: any) => ({ ...s, port: 0 }));
 	access.openWindow();
 	const win = fake.windows[0];
-	return { fake, access, win, call: (channel: string, ...args: unknown[]) => fake.invoke(channel, win.webContents, ...args) };
+	// The phone side: pinned to the gateway certificate (known once it runs).
+	let client: ReturnType<typeof pinnedFetch> | null = null;
+	const phone = (url: string, init?: RequestInit) => (client ??= pinnedFetch(access.gateway.pin()))(url, init);
+	const stop = access.stop;
+	access.stop = async () => {
+		await client?.close();
+		await stop();
+	};
+	return { fake, access, win, phone, call: (channel: string, ...args: unknown[]) => fake.invoke(channel, win.webContents, ...args) };
 }
 
 test("calls from another webContents are refused", async () => {
@@ -92,7 +102,7 @@ test("pairing needs the gateway on; copy needs a shown code", async () => {
 });
 
 test("copied pairing text is the QR payload; the window page gets neither the code nor a token", async () => {
-	const { call, fake, access } = setup();
+	const { call, fake, access, phone } = setup();
 	const state = await call("lh:phone:set-enabled", true);
 	assert.equal(state.running, true);
 	const shown = await call("lh:phone:pair");
@@ -101,14 +111,15 @@ test("copied pairing text is the QR payload; the window page gets neither the co
 
 	assert.deepEqual(await call("lh:phone:copy-pairing"), { ok: true });
 	const payload = JSON.parse(fake.clipboard());
-	assert.equal(payload.lh, 1);
+	assert.equal(payload.lh, 2);
 	assert.equal(payload.name, "Test Mac");
 	assert.deepEqual(payload.urls, shown.urls);
+	assert.equal(payload.pin, access.gateway.pin(), "the QR payload carries the certificate pin");
 	assert.equal(typeof payload.code, "string");
 
 	// The copied code pairs exactly once through the real gateway.
 	const port = access.gateway.address().port;
-	const pair = (code: string) => fetch(`http://127.0.0.1:${port}/phone/v1/pair`, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ code, deviceName: "Sim" }) });
+	const pair = (code: string) => phone(`https://127.0.0.1:${port}/phone/v1/pair`, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ code, deviceName: "Sim" }) });
 	assert.equal((await pair(payload.code)).status, 200);
 	assert.equal((await pair(payload.code)).status, 401);
 
@@ -131,31 +142,31 @@ test("cancel and window close forget the copied payload", async () => {
 });
 
 test("revoke removes the device and pushes the new state to the window", async () => {
-	const { call, fake, access } = setup();
+	const { call, fake, access, phone } = setup();
 	await call("lh:phone:set-enabled", true);
 	await call("lh:phone:pair");
 	await call("lh:phone:copy-pairing");
 	const { code } = JSON.parse(fake.clipboard());
 	const port = access.gateway.address().port;
-	const res = await fetch(`http://127.0.0.1:${port}/phone/v1/pair`, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ code }) });
+	const res = await phone(`https://127.0.0.1:${port}/phone/v1/pair`, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ code }) });
 	const { deviceId, token } = await res.json();
 	const state = await call("lh:phone:revoke", deviceId);
 	assert.deepEqual(state.devices, []);
 	assert.ok(fake.sent.some((m) => m.channel === "lh:phone:changed" && m.value.devices.length === 0));
-	const ping = await fetch(`http://127.0.0.1:${port}/phone/v1/ping`, { headers: { authorization: `Bearer ${token}` } });
+	const ping = await phone(`https://127.0.0.1:${port}/phone/v1/ping`, { headers: { authorization: `Bearer ${token}` } });
 	assert.equal(ping.status, 401);
 	await access.stop();
 });
 
 test("a phone that pairs makes the window drop the spent code and list the device", async () => {
-	const { call, fake, access } = setup();
+	const { call, fake, access, phone } = setup();
 	await call("lh:phone:set-enabled", true);
 	await call("lh:phone:pair");
 	await call("lh:phone:copy-pairing");
 	const { code } = JSON.parse(fake.clipboard());
 	fake.sent.length = 0;
 	const port = access.gateway.address().port;
-	const res = await fetch(`http://127.0.0.1:${port}/phone/v1/pair`, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ code, deviceName: "Test iPhone" }) });
+	const res = await phone(`https://127.0.0.1:${port}/phone/v1/pair`, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ code, deviceName: "Test iPhone" }) });
 	assert.equal(res.status, 200);
 	assert.deepEqual(fake.sent.find((m) => m.channel === "lh:phone:paired")?.value, { name: "Test iPhone" });
 	const changed = fake.sent.find((m) => m.channel === "lh:phone:changed");
@@ -165,13 +176,13 @@ test("a phone that pairs makes the window drop the spent code and list the devic
 });
 
 test("wrong codes that cancel the code make the window drop the dead QR code", async () => {
-	const { call, fake, access } = setup();
+	const { call, fake, access, phone } = setup();
 	await call("lh:phone:set-enabled", true);
 	await call("lh:phone:pair");
 	fake.sent.length = 0;
 	const port = access.gateway.address().port;
 	for (let i = 0; i < 10; i++) {
-		await fetch(`http://127.0.0.1:${port}/phone/v1/pair`, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ code: `wrong-${i}` }) });
+		await phone(`https://127.0.0.1:${port}/phone/v1/pair`, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ code: `wrong-${i}` }) });
 	}
 	assert.ok(fake.sent.some((m) => m.channel === "lh:phone:pair-cancelled"));
 	assert.deepEqual(await call("lh:phone:copy-pairing"), { error: "Show a new QR code first." });
