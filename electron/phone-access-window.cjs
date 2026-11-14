@@ -21,11 +21,21 @@ const { createPhoneAccessStore, createPhoneGateway, reachableAddresses } = requi
 /** `electron` is injected by main.cjs (its own module objects), so test
  * harnesses that fake Electron also fake this window. */
 function createPhoneAccess({ electron, file, target, info, log }) {
-	const { BrowserWindow, ipcMain, shell } = electron;
+	const { BrowserWindow, ipcMain, shell, clipboard } = electron;
 	const store = createPhoneAccessStore(file);
-	const gateway = createPhoneGateway({ store, target, info, log });
 	let win = null;
+	// A phone used the code: forget the payload and tell the window, so it
+	// hides the spent QR code and lists the new device.
+	const onPaired = (device) => {
+		currentPayload = null;
+		if (win && !win.isDestroyed()) win.webContents.send("lh:phone:paired", { name: device.name });
+		push();
+	};
+	const gateway = createPhoneGateway({ store, target, info, log, onPaired });
 	let lastError = null;
+	// The current pairing payload. Only main keeps it: "Copy pairing text"
+	// writes it to the clipboard, so the window page never holds the code.
+	let currentPayload = null;
 
 	function snapshot() {
 		const state = store.read();
@@ -78,11 +88,20 @@ function createPhoneAccess({ electron, file, target, info, log }) {
 		if (!gateway.running()) return { error: "Turn on phone access first." };
 		const { code, expiresAt } = gateway.startPairing();
 		const payload = gateway.pairingPayload(code);
+		currentPayload = { text: payload, expiresAt };
 		const svg = qrSVG(payload);
 		return { svg, expiresAt, urls: JSON.parse(payload).urls };
 	});
 	ipcMain.handle("lh:phone:cancel-pair", (event) => {
-		if (fromWindow(event)) gateway.cancelPairing();
+		if (!fromWindow(event)) return;
+		currentPayload = null;
+		gateway.cancelPairing();
+	});
+	ipcMain.handle("lh:phone:copy-pairing", (event) => {
+		if (!fromWindow(event)) return null;
+		if (!currentPayload || Date.now() > currentPayload.expiresAt) return { error: "Show a new QR code first." };
+		clipboard.writeText(currentPayload.text);
+		return { ok: true };
 	});
 	ipcMain.handle("lh:phone:revoke", (event, deviceId) => {
 		if (!fromWindow(event) || typeof deviceId !== "string") return null;
@@ -115,6 +134,7 @@ function createPhoneAccess({ electron, file, target, info, log }) {
 			return { action: "deny" };
 		});
 		win.on("closed", () => {
+			currentPayload = null;
 			gateway.cancelPairing();
 			win = null;
 		});

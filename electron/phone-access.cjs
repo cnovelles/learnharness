@@ -37,9 +37,9 @@ const ROUTES = [
 	{ methods: ["POST"], pattern: /^\/api\/chat$/ },
 	{ methods: ["GET", "POST"], pattern: /^\/api\/chats$/ },
 	{ methods: ["GET", "PUT"], pattern: /^\/api\/chats\/[^/]+$/ },
-	{ methods: ["GET"], pattern: /^\/api\/chats\/[^/]+\/(stream|markdown|artifact-ui)$/ },
-	{ methods: ["POST"], pattern: /^\/api\/chats\/[^/]+\/(dismiss|steer)$/ },
-	{ methods: ["GET", "PUT"], pattern: /^\/api\/chats\/[^/]+\/settings$/ },
+	{ methods: ["GET"], pattern: /^\/api\/chats\/[^/]+\/(stream|markdown)$/ },
+	{ methods: ["POST"], pattern: /^\/api\/chats\/[^/]+\/(dismiss|steer|artifact-ui)$/ },
+	{ methods: ["PUT"], pattern: /^\/api\/chats\/[^/]+\/settings$/ },
 	{ methods: ["GET"], pattern: /^\/api\/events$/ },
 	{ methods: ["GET"], pattern: /^\/api\/activity$/ },
 	{ methods: ["POST"], pattern: /^\/api\/activity\/abort$/ },
@@ -158,8 +158,9 @@ const HOP_HEADERS = new Set(["connection", "keep-alive", "transfer-encoding", "u
  * @param {{name?: string, version?: string}} [options.info]
  * @param {(line: string) => void} [options.log]
  * @param {() => number} [options.now]
+ * @param {(device: {id: string, name: string}) => void} [options.onPaired] called after a phone pairs
  */
-function createPhoneGateway({ store, target, info = {}, log = () => {}, now = () => Date.now() }) {
+function createPhoneGateway({ store, target, info = {}, log = () => {}, now = () => Date.now(), onPaired = () => {} }) {
 	let server = null;
 	let pairing = null; // {codeHash, expiresAt}
 	const failedPairs = [];
@@ -227,6 +228,11 @@ function createPhoneGateway({ store, target, info = {}, log = () => {}, now = ()
 		};
 		store.update((state) => ({ ...state, devices: [...state.devices, device] }));
 		log(`phone access: paired ${device.id} (${device.name})`);
+		try {
+			onPaired({ id: device.id, name: device.name });
+		} catch (err) {
+			log(`phone access: onPaired failed: ${err.message}`);
+		}
 		sendJSON(res, 200, { token, deviceId: device.id, protocol: PROTOCOL, server: { name: info.name ?? os.hostname(), version: info.version ?? null } });
 	}
 

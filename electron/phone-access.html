@@ -12,7 +12,7 @@
 	p { margin: 0 0 12px; color: var(--muted); }
 	section { background: var(--panel); border: 1px solid var(--line); border-radius: 10px; padding: 16px; margin-bottom: 16px; }
 	.row { display: flex; align-items: center; justify-content: space-between; gap: 12px; }
-	button { background: #2a2a2a; color: var(--text); border: 1px solid var(--line); border-radius: 8px; padding: 6px 12px; font: inherit; cursor: pointer; }
+	button { white-space: nowrap; flex-shrink: 0; background: #2a2a2a; color: var(--text); border: 1px solid var(--line); border-radius: 8px; padding: 6px 12px; font: inherit; cursor: pointer; }
 	button.primary { background: var(--accent); color: #111; border-color: var(--accent); }
 	button.danger { color: var(--danger); }
 	button:disabled { opacity: .5; cursor: default; }
@@ -46,9 +46,14 @@
 			<strong>Pair a phone</strong>
 			<button class="primary" id="pair">Show QR code</button>
 		</div>
+		<p class="small" id="pairResult" hidden></p>
 		<div id="pairBox" hidden>
 			<div id="qr"></div>
 			<p class="small" id="pairDetail"></p>
+			<div class="row">
+				<span class="small">No camera (for example, the iOS Simulator)? Copy the pairing text and paste it into the phone app.</span>
+				<button id="copyPairing">Copy pairing text</button>
+			</div>
 		</div>
 	</section>
 
