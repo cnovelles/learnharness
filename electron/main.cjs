@@ -24,7 +24,7 @@
  *     would shadow every settings-page key change until restart.
  */
 
-const { app, BrowserWindow, Menu, ipcMain, nativeTheme, session, shell, dialog } = require("electron");
+const { app, BrowserWindow, Menu, clipboard, ipcMain, nativeTheme, session, shell, dialog } = require("electron");
 const { pickAttachmentPath } = require("./attachment-picker.cjs");
 const { createChatGPT, fileStore } = require("./chatgpt.cjs");
 const { attachChatGPTChild, trustedSender, chatGPTControl } = require("./chatgpt-ipc.cjs");
@@ -759,7 +759,7 @@ async function main() {
 
 	// Mobile fork: the phone gateway forwards to the same loopback server.
 	phoneAccess = createPhoneAccess({
-		electron: { BrowserWindow, ipcMain, shell },
+		electron: { BrowserWindow, ipcMain, shell, clipboard },
 		file: path.join(app.getPath("userData"), "phone-access.json"),
 		target: () => ({ url, secret: desktopAPISecret }),
 		info: { name: require("node:os").hostname(), version: app.getVersion() },

@@ -64,7 +64,10 @@ function render(state) {
 			const remove = document.createElement("button");
 			remove.className = "danger";
 			text(remove, "Remove");
-			remove.addEventListener("click", async () => render(await api.revoke(d.id)));
+			remove.addEventListener("click", async () => {
+				$("pairResult").hidden = true;
+				render(await api.revoke(d.id));
+			});
 			li.append(info, remove);
 			return li;
 		}),
@@ -85,6 +88,7 @@ function hidePair() {
 }
 
 async function showPair() {
+	$("pairResult").hidden = true;
 	const result = await api.pair();
 	if (!result || result.error) {
 		$("error").hidden = false;
@@ -117,5 +121,20 @@ $("toggle").addEventListener("click", async () => {
 	}
 });
 $("pair").addEventListener("click", () => void showPair());
+$("copyPairing").addEventListener("click", async () => {
+	const result = await api.copyPairing();
+	if (!result || result.error) {
+		$("error").hidden = false;
+		text($("error"), result?.error ?? "Copy failed.");
+		return;
+	}
+	text($("copyPairing"), "Copied");
+	setTimeout(() => text($("copyPairing"), "Copy pairing text"), 2000);
+});
 api.onChanged(render);
+api.onPaired((device) => {
+	hidePair();
+	$("pairResult").hidden = false;
+	text($("pairResult"), `${device.name} is paired. To pair another phone, show a new QR code.`);
+});
 api.state().then(render);

@@ -29,7 +29,8 @@ test("allowlist passes the phone's chat, stream, event and read routes", () => {
 		["GET", "/api/chats/chat_abc/stream"],
 		["POST", "/api/chats/chat_abc/dismiss"],
 		["POST", "/api/chats/chat_abc/steer"],
-		["GET", "/api/chats/chat_abc/settings"],
+		["PUT", "/api/chats/chat_abc/settings"],
+		["POST", "/api/chats/chat_abc/artifact-ui"],
 		["GET", "/api/events"],
 		["GET", "/api/models"],
 		["GET", "/api/settings"],
@@ -53,6 +54,8 @@ test("allowlist refuses credentials, providers, prompts, settings writes, delete
 		["DELETE", "/api/chats/chat_abc"],
 		["PATCH", "/api/chats/chat_abc"],
 		["POST", "/api/stt/token"],
+		["GET", "/api/chats/chat_abc/settings"],
+		["GET", "/api/chats/chat_abc/artifact-ui"],
 		["POST", "/api/graph/import"],
 		["DELETE", "/api/graph/nodes/n1"],
 		["PUT", "/api/graph/positions"],
@@ -111,7 +114,8 @@ async function harness(options: { now?: () => number; upstream?: http.RequestLis
 	await new Promise<void>((r) => upstream.listen(0, "127.0.0.1", r));
 	const upstreamURL = `http://127.0.0.1:${(upstream.address() as AddressInfo).port}`;
 	const store = createPhoneAccessStore(tempFile());
-	const gateway = createPhoneGateway({ store, target: () => ({ url: upstreamURL, secret: SECRET }), info: { name: "test-mac", version: "0.0.0" }, now: options.now });
+	const paired: Array<{ id: string; name: string }> = [];
+	const gateway = createPhoneGateway({ store, target: () => ({ url: upstreamURL, secret: SECRET }), info: { name: "test-mac", version: "0.0.0" }, now: options.now, onPaired: (d: { id: string; name: string }) => paired.push(d) });
 	const addr = await gateway.start({ host: "127.0.0.1", port: 0 });
 	const base = `http://127.0.0.1:${addr.port}`;
 	const close = async () => {
@@ -119,7 +123,7 @@ async function harness(options: { now?: () => number; upstream?: http.RequestLis
 		await new Promise<void>((r) => upstream.close(() => r()));
 	};
 	const pair = async (code: string) => fetch(`${base}/phone/v1/pair`, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ code, deviceName: "iPhone" }) });
-	return { seen, store, gateway, base, close, pair, upstream };
+	return { seen, store, gateway, base, close, pair, upstream, paired };
 }
 
 test("pairing: one use, no code without a session, wrong code refused", async () => {
@@ -138,6 +142,7 @@ test("pairing: one use, no code without a session, wrong code refused", async ()
 		assert.equal(devices.length, 1);
 		assert.equal(devices[0].name, "iPhone");
 		assert.equal(devices[0].tokenHash, hashToken(body.token));
+		assert.deepEqual(h.paired, [{ id: body.deviceId, name: "iPhone" }], "onPaired fires once, for the successful pair only");
 	} finally {
 		await h.close();
 	}
