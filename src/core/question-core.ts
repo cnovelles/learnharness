@@ -19,6 +19,7 @@
 
 import { Type, type Static } from "typebox";
 import { stripModelValueDebris } from "./value-debris.ts";
+import { toolQuestionKind } from "./pending.ts";
 
 // ─── shared types ───────────────────────────────────────────────────────────
 
@@ -699,6 +700,61 @@ export function toClientQuestion(qd: QuestionData): ClientQuestion {
 function formatOptionRef(options: QuizOption[], index: number): string {
 	const opt = options.find((o, i) => i + 1 === index);
 	return `${index}. ${opt ? opt.label : "(unknown)"}`;
+}
+
+/**
+ * Canonical QuestionData for one pending question call (mobile fork: moved
+ * here from components/question-dock.tsx so the phone dock shares it).
+ * Quiz options are deterministically shuffled (seeded by toolCallId) so
+ * position never leaks correctness and every client renders the same order;
+ * the display order is snapshotted into the answer record at submit time.
+ */
+export function questionDataForCall(toolName: string, toolCallId: string, input: unknown, onError: (message: string) => void = () => {}): QuestionData {
+	const kind = toolQuestionKind(toolName);
+	const anyInput = (input ?? {}) as { question: string; details?: string; multiSelect?: unknown; type?: unknown };
+	const quizInput = kind === "quiz" ? (input as QuizToolInput) : null;
+	const askInput = kind === "ask" ? (input as AskToolInput) : null;
+	const explainInput = kind === "explain" ? (input as ExplainToolInput) : null;
+	const multi = input instanceof Object && "multiSelect" in input ? anyInput.multiSelect === true : false;
+	const mode: QuestionMode =
+		kind === "quiz"
+			? multi
+				? "multi-select"
+				: "single-select"
+			: askInput?.options?.length
+				? multi
+					? "multi-select"
+					: "single-select"
+				: "text";
+	const options = normalizeOptions(
+		(quizInput?.options ?? askInput?.options ?? []) as { label: string; value?: string }[],
+	);
+	const ordered = kind === "quiz" && options.length > 0 ? shuffleOptions(options, seededRandom(toolCallId)) : options;
+	const q: QuestionData = {
+		id: toolCallId,
+		kind,
+		// The role (owner 2026-10-03): predict questions gate by it in the
+		// view (never collapsed) and the answered card tucks the explanation.
+		questionType: kind === "quiz" ? normalizeQuizType(anyInput.type) : undefined,
+		question: anyInput.question,
+		context: anyInput.details,
+		mode,
+		options: ordered,
+		createdAt: new Date().toISOString(),
+	};
+	if (quizInput) {
+		const resolved = resolveCorrect(quizInput.correctAnswer, ordered);
+		if (resolved.error) onError(`[quiz] correctAnswer did not resolve: ${resolved.error}`);
+		q.correctIndices = resolved.indices;
+		q.explanation = quizInput.explanation;
+	}
+	if (explainInput) {
+		// The commitment rides the question data (never sent to the client
+		// before answering) and snapshots into the answer at submit. One
+		// field, reasoning included (owner ruling 2026-09-27).
+		q.committedAnswer = explainInput.correctAnswer;
+	}
+	return q;
 }
 
 /**

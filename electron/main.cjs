@@ -31,6 +31,7 @@ const { createSubscriptions, loadSubscriptionSDK } = require("./subscriptions.cj
 const { attachSubscriptionChild, subscriptionControl } = require("./subscription-ipc.cjs");
 const { desktopAPIHeaders } = require("./desktop-api.cjs");
 const { openWebSubscriptionBrowser } = require("./web-subscription-browser.cjs");
+const { createPhoneAccess } = require("./phone-access-window.cjs");
 const { randomBytes } = require("node:crypto");
 const { spawn } = require("node:child_process");
 const fs = require("node:fs");
@@ -43,6 +44,10 @@ const path = require("node:path");
 const SIDEBAR_AUTOCLOSE = 928;
 
 const PRODUCT_NAME = "LearnHarness";
+// Mobile fork: upstream auto-update is off. LH_FORK_UPSTREAM_UPDATES=1 turns
+// it back on (the upstream updater tests use it to keep that code covered).
+const FORK_UPDATES_DISABLED = process.env.LH_FORK_UPSTREAM_UPDATES !== "1";
+let phoneAccess = null; // mobile fork: phone gateway + its window
 
 // APP NAME → userData (owner, 2026-10-10): the Application Support dir is
 // exactly "LearnHarness" in dev AND packaged. Packaged Electron would
@@ -504,6 +509,13 @@ function installUpdateNow() {
 }
 
 function setupAutoUpdater() {
+	// Mobile fork: an upstream update would replace this fork and remove phone
+	// access. Merge upstream releases into the fork manually instead.
+	if (FORK_UPDATES_DISABLED) {
+		log("auto-update: mobile fork — updater disabled");
+		reportUpdateStatus("disabled");
+		return;
+	}
 	if (!app.isPackaged) {
 		log("auto-update: dev build — updater disabled");
 		reportUpdateStatus("disabled");
@@ -589,6 +601,8 @@ function installMenu() {
 				{ role: "about" },
 				// Manual checks report their result in Settings → General.
 				{ label: "Check for Updates…", click: () => checkForUpdatesFromMenu() },
+				{ type: "separator" },
+				{ label: "Phone Access…", click: () => phoneAccess?.openWindow() },
 				{ type: "separator" },
 				{ role: "hide" },
 				{ role: "hideOthers" },
@@ -684,6 +698,17 @@ async function main() {
 	} else {
 		log(`dev mode: ${devUrl}`);
 	}
+
+	// Mobile fork: the phone gateway forwards to the same loopback server.
+	phoneAccess = createPhoneAccess({
+		electron: { BrowserWindow, ipcMain, shell },
+		file: path.join(app.getPath("userData"), "phone-access.json"),
+		target: () => ({ url, secret: desktopAPISecret }),
+		info: { name: require("node:os").hostname(), version: app.getVersion() },
+		log,
+	});
+	app.on("before-quit", () => void phoneAccess?.stop());
+	await phoneAccess.startIfEnabled();
 
 	// Renderer controls contain no token/URL/code operation. The separate server
 	// child is the only recipient of credential leases over inherited IPC.
