@@ -167,14 +167,16 @@ const HOP_HEADERS = new Set(["connection", "keep-alive", "transfer-encoding", "u
  * @param {() => number} [options.now]
  * @param {(device: {id: string, name: string}) => void} [options.onPaired] called after a phone pairs
  * @param {(reason: "too-many-attempts") => void} [options.onPairingCancelled] called when wrong codes cancel the active code
+ * @param {() => ReturnType<typeof os.networkInterfaces>} [options.networkInterfaces] the network interfaces (tests replace it)
  */
-function createPhoneGateway({ store, target, tlsDir, info = {}, log = () => {}, now = () => Date.now(), onPaired = () => {}, onPairingCancelled = () => {} }) {
+function createPhoneGateway({ store, target, tlsDir, info = {}, log = () => {}, now = () => Date.now(), onPaired = () => {}, onPairingCancelled = () => {}, networkInterfaces = () => os.networkInterfaces() }) {
 	let server = null;
 	let certificate = null; // {key, cert, pin}, loaded by start()
 	// The active one-use code. `failures` counts wrong codes against THIS code
 	// only: a device on the network can cancel a code, but it cannot block the
 	// next one (a new code starts at zero).
-	let pairing = null; // {codeHash, expiresAt, failures}
+	// `tailscale`: the last payload for this code had a Tailscale address.
+	let pairing = null; // {codeHash, expiresAt, failures, tailscale?}
 	const lastSeenSaved = new Map();
 	const sockets = new Set();
 	// Open proxied requests by device id, so a revoke closes them at once.
@@ -190,10 +192,19 @@ function createPhoneGateway({ store, target, tlsDir, info = {}, log = () => {}, 
 		pairing = null;
 	}
 
+	/** The addresses a phone can reach now (Tailscale first). */
+	function addresses() {
+		return reachableAddresses(networkInterfaces());
+	}
+
 	/** The pairing payload (QR code and "Copy pairing text"). Needs a started gateway (the pin). */
 	function pairingPayload(code, port = store.read().port) {
 		if (!certificate) throw new Error("phone access: start the gateway before pairing");
-		const urls = reachableAddresses().map((a) => `https://${a.address}:${port}`);
+		const list = addresses();
+		// The phone knows only the addresses in this payload. Keep a note of
+		// whether a Tailscale address was one of them, for the device record.
+		if (pairing) pairing.tailscale = list.some((a) => a.kind === "tailscale");
+		const urls = list.map((a) => `https://${a.address}:${port}`);
 		return JSON.stringify({ lh: PROTOCOL, name: info.name ?? os.hostname(), urls, pin: certificate.pin, code });
 	}
 
@@ -256,6 +267,7 @@ function createPhoneGateway({ store, target, tlsDir, info = {}, log = () => {}, 
 			}
 			return sendJSON(res, 401, { error: "The pairing code is not valid or has expired. Show a new QR code on the Mac." });
 		}
+		const offeredTailscale = pairing.tailscale;
 		pairing = null; // one use
 		const token = randomToken(32);
 		const device = {
@@ -264,6 +276,9 @@ function createPhoneGateway({ store, target, tlsDir, info = {}, log = () => {}, 
 			tokenHash: hashToken(token),
 			createdAt: new Date(t).toISOString(),
 			lastSeenAt: new Date(t).toISOString(),
+			// false: the phone got no Tailscale address, so it can connect only
+			// on the local network. Absent: not known (no payload was made).
+			...(typeof offeredTailscale === "boolean" ? { tailscale: offeredTailscale } : {}),
 		};
 		store.update((state) => ({ ...state, devices: [...state.devices, device] }));
 		log(`phone access: paired ${device.id} (${device.name})`);
@@ -394,7 +409,7 @@ function createPhoneGateway({ store, target, tlsDir, info = {}, log = () => {}, 
 		log(`phone access: revoked ${deviceId}${open?.size ? ` and closed ${open.size} open request(s)` : ""}`);
 	}
 
-	return { start, stop, startPairing, cancelPairing, pairingPayload, revoke, running: () => server !== null, address: () => server?.address() ?? null, pin: () => certificate?.pin ?? null };
+	return { start, stop, startPairing, cancelPairing, pairingPayload, addresses, revoke, running: () => server !== null, address: () => server?.address() ?? null, pin: () => certificate?.pin ?? null };
 }
 
 module.exports = {

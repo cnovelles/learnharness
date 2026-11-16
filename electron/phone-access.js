@@ -27,6 +27,7 @@ function render(state) {
 	text($("error"), state.error ?? "");
 	$("pairSection").hidden = !state.running;
 	$("addressSection").hidden = !state.running;
+	$("noTailscale").hidden = !state.running || state.tailscale;
 	if (!state.running) hidePair();
 
 	const addresses = $("addresses");
@@ -61,6 +62,13 @@ function render(state) {
 			seen.className = "small";
 			text(seen, `Paired ${fmt(d.createdAt)} · last seen ${fmt(d.lastSeenAt)}`);
 			info.append(name, seen);
+			// The phone got no Tailscale address when it paired.
+			if (d.tailscale === false) {
+				const lan = document.createElement("div");
+				lan.className = "warn-text";
+				text(lan, "Home Wi-Fi only. Pair again with Tailscale on.");
+				info.append(lan);
+			}
 			const remove = document.createElement("button");
 			remove.className = "danger";
 			text(remove, "Remove");

@@ -104,7 +104,7 @@ test("addresses list Tailscale first and skip loopback and IPv6", () => {
 
 interface Seen { method: string; url: string; headers: http.IncomingHttpHeaders; body: string }
 
-async function harness(options: { now?: () => number; upstream?: http.RequestListener; onPairingCancelled?: (reason: string) => void } = {}) {
+async function harness(options: { now?: () => number; upstream?: http.RequestListener; onPairingCancelled?: (reason: string) => void; networkInterfaces?: () => Record<string, any[]> } = {}) {
 	const seen: Seen[] = [];
 	const upstream = http.createServer(options.upstream ?? ((req, res) => {
 		const chunks: Buffer[] = [];
@@ -121,7 +121,7 @@ async function harness(options: { now?: () => number; upstream?: http.RequestLis
 	const store = createPhoneAccessStore(storeFile);
 	const paired: Array<{ id: string; name: string }> = [];
 	const tlsDir = path.join(path.dirname(storeFile), "tls");
-	const gateway = createPhoneGateway({ store, tlsDir, target: () => ({ url: upstreamURL, secret: SECRET }), info: { name: "test-mac", version: "0.0.0" }, now: options.now, onPaired: (d: { id: string; name: string }) => paired.push(d), onPairingCancelled: options.onPairingCancelled });
+	const gateway = createPhoneGateway({ store, tlsDir, target: () => ({ url: upstreamURL, secret: SECRET }), info: { name: "test-mac", version: "0.0.0" }, now: options.now, onPaired: (d: { id: string; name: string }) => paired.push(d), onPairingCancelled: options.onPairingCancelled, networkInterfaces: options.networkInterfaces });
 	const addr = await gateway.start({ host: "127.0.0.1", port: 0 });
 	const base = `https://127.0.0.1:${addr.port}`;
 	const fetch = pinnedFetch(gateway.pin());
@@ -465,6 +465,42 @@ test("a new certificate removes the paired phones; they must pair again", async 
 		const newPhone = pinnedFetch(h.gateway.pin());
 		assert.equal((await newPhone(`https://127.0.0.1:${addr.port}/phone/v1/ping`, { headers: { authorization: `Bearer ${token}` } })).status, 401, "the old token is gone");
 		await newPhone.close();
+	} finally {
+		await h.close();
+	}
+});
+
+const LAN_ONLY = () => ({ en0: [{ address: "192.168.1.20", family: "IPv4", internal: false }] });
+const WITH_TAILSCALE = () => ({ ...LAN_ONLY(), utun4: [{ address: "100.101.102.103", family: "IPv4", internal: false }] });
+
+test("a device record notes whether its pairing payload had a Tailscale address", async () => {
+	let interfaces: () => Record<string, any[]> = LAN_ONLY;
+	const h = await harness({ networkInterfaces: () => interfaces() });
+	try {
+		const first = h.gateway.startPairing();
+		const lanPayload = JSON.parse(h.gateway.pairingPayload(first.code));
+		assert.deepEqual(lanPayload.urls.map((u: string) => new URL(u).hostname), ["192.168.1.20"]);
+		assert.equal((await h.pair(first.code)).status, 200);
+
+		interfaces = WITH_TAILSCALE;
+		const second = h.gateway.startPairing();
+		const payload = JSON.parse(h.gateway.pairingPayload(second.code));
+		assert.equal(new URL(payload.urls[0]).hostname, "100.101.102.103", "Tailscale first");
+		assert.equal((await h.pair(second.code)).status, 200);
+
+		const third = h.gateway.startPairing();
+		assert.equal((await h.pair(third.code)).status, 200, "a code with no payload still pairs");
+
+		assert.deepEqual(h.store.read().devices.map((d: any) => d.tailscale), [false, true, undefined]);
+	} finally {
+		await h.close();
+	}
+});
+
+test("the gateway lists the addresses of the network interfaces it is given", async () => {
+	const h = await harness({ networkInterfaces: WITH_TAILSCALE });
+	try {
+		assert.deepEqual(h.gateway.addresses().map((a: any) => a.kind), ["tailscale", "lan"]);
 	} finally {
 		await h.close();
 	}
