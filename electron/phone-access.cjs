@@ -290,6 +290,15 @@ function createPhoneGateway({ store, target, tlsDir, info = {}, log = () => {}, 
 		sendJSON(res, 200, { token, deviceId: device.id, protocol: PROTOCOL, server: { name: info.name ?? os.hostname(), version: info.version ?? null } });
 	}
 
+	// Upstream requests that the gateway closes on purpose (the phone went
+	// away, a body was too large, a revoke). Node reports such a close as
+	// "socket hang up", which is not a failure, so it is not logged.
+	const closedOnPurpose = new WeakSet();
+	function closeUpstream(upstream) {
+		closedOnPurpose.add(upstream);
+		upstream.destroy();
+	}
+
 	function track(deviceId, entry) {
 		let set = activeByDevice.get(deviceId);
 		if (!set) activeByDevice.set(deviceId, (set = new Set()));
@@ -318,6 +327,7 @@ function createPhoneGateway({ store, target, tlsDir, info = {}, log = () => {}, 
 			upRes.pipe(res);
 		});
 		upstream.on("error", (err) => {
+			if (closedOnPurpose.has(upstream)) return;
 			log(`phone access: upstream error ${err.message}`);
 			if (!res.headersSent) sendJSON(res, 502, { error: "The LearnHarness server is not reachable." });
 			else res.destroy();
@@ -326,13 +336,13 @@ function createPhoneGateway({ store, target, tlsDir, info = {}, log = () => {}, 
 		// A phone that disconnects detaches its view, like a closed browser tab.
 		res.on("close", () => {
 			untrack();
-			if (!res.writableFinished) upstream.destroy();
+			if (!res.writableFinished) closeUpstream(upstream);
 		});
 		let size = 0;
 		req.on("data", (chunk) => {
 			size += chunk.length;
 			if (size > MAX_BODY_BYTES) {
-				upstream.destroy();
+				closeUpstream(upstream);
 				if (!res.headersSent) sendJSON(res, 413, { error: "Request body too large." });
 				req.destroy();
 			}
@@ -402,7 +412,7 @@ function createPhoneGateway({ store, target, tlsDir, info = {}, log = () => {}, 
 		const open = activeByDevice.get(deviceId);
 		activeByDevice.delete(deviceId);
 		for (const { res, upstream } of open ?? []) {
-			upstream.destroy();
+			closeUpstream(upstream);
 			res.destroy();
 		}
 		lastSeenSaved.delete(deviceId);

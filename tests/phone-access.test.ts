@@ -121,7 +121,8 @@ async function harness(options: { now?: () => number; upstream?: http.RequestLis
 	const store = createPhoneAccessStore(storeFile);
 	const paired: Array<{ id: string; name: string }> = [];
 	const tlsDir = path.join(path.dirname(storeFile), "tls");
-	const gateway = createPhoneGateway({ store, tlsDir, target: () => ({ url: upstreamURL, secret: SECRET }), info: { name: "test-mac", version: "0.0.0" }, now: options.now, onPaired: (d: { id: string; name: string }) => paired.push(d), onPairingCancelled: options.onPairingCancelled, networkInterfaces: options.networkInterfaces });
+	const logs: string[] = [];
+	const gateway = createPhoneGateway({ store, tlsDir, log: (line: string) => logs.push(line), target: () => ({ url: upstreamURL, secret: SECRET }), info: { name: "test-mac", version: "0.0.0" }, now: options.now, onPaired: (d: { id: string; name: string }) => paired.push(d), onPairingCancelled: options.onPairingCancelled, networkInterfaces: options.networkInterfaces });
 	const addr = await gateway.start({ host: "127.0.0.1", port: 0 });
 	const base = `https://127.0.0.1:${addr.port}`;
 	const fetch = pinnedFetch(gateway.pin());
@@ -131,7 +132,7 @@ async function harness(options: { now?: () => number; upstream?: http.RequestLis
 		await new Promise<void>((r) => upstream.close(() => r()));
 	};
 	const pair = async (code: string) => fetch(`${base}/phone/v1/pair`, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ code, deviceName: "iPhone" }) });
-	return { seen, store, tlsDir, gateway, base, close, pair, upstream, paired, fetch };
+	return { seen, store, tlsDir, gateway, base, close, pair, upstream, paired, fetch, logs };
 }
 
 test("pairing: one use, no code without a session, wrong code refused", async () => {
@@ -315,6 +316,36 @@ test("a phone that disconnects closes the upstream request", async () => {
 		await res.body!.getReader().read();
 		controller.abort();
 		await Promise.race([closed, new Promise((_, rej) => setTimeout(() => rej(new Error("upstream not closed")), 2000))]);
+		await new Promise((r) => setTimeout(r, 100));
+		// A normal disconnect (the app goes to the background) is not an error.
+		assert.deepEqual(h.logs.filter((l) => l.includes("upstream error")), []);
+	} finally {
+		await h.close();
+	}
+});
+
+test("a phone that disconnects before the server answers is not an upstream error", async () => {
+	let upstreamClosed: () => void = () => {};
+	const closed = new Promise<void>((r) => (upstreamClosed = r));
+	let arrived: () => void = () => {};
+	const reached = new Promise<void>((r) => (arrived = r));
+	const h = await harness({
+		upstream: (req) => {
+			// No answer yet, like a turn that waits for the model.
+			req.on("close", () => upstreamClosed());
+			arrived();
+		},
+	});
+	try {
+		const token = await pairedToken(h);
+		const controller = new AbortController();
+		const res = h.fetch(`${h.base}/api/chats`, { headers: { authorization: `Bearer ${token}` }, signal: controller.signal }).catch(() => null);
+		await reached;
+		controller.abort();
+		await res;
+		await Promise.race([closed, new Promise((_, rej) => setTimeout(() => rej(new Error("upstream not closed")), 2000))]);
+		await new Promise((r) => setTimeout(r, 100));
+		assert.deepEqual(h.logs.filter((l) => l.includes("upstream error")), []);
 	} finally {
 		await h.close();
 	}
@@ -357,6 +388,7 @@ test("revoke closes the device's open streams on both sides; other devices keep 
 		// The other device's stream stays open.
 		const stillOpen = await Promise.race([other.read().then(() => "data"), new Promise((r) => setTimeout(() => r("open"), 200))]);
 		assert.equal(stillOpen, "open");
+		assert.deepEqual(h.logs.filter((l) => l.includes("upstream error")), [], "a revoke is not an upstream error");
 		await other.cancel();
 	} finally {
 		await h.close();
@@ -370,6 +402,7 @@ test("an unreachable server gives 502", async () => {
 		await new Promise<void>((r) => h.upstream.close(() => r()));
 		const res = await h.fetch(`${h.base}/api/chats`, { headers: { authorization: `Bearer ${token}` } });
 		assert.equal(res.status, 502);
+		assert.match(h.logs.join("\n"), /upstream error .*ECONNREFUSED/, "a real failure is still logged");
 	} finally {
 		await h.gateway.stop();
 	}
