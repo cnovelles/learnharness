@@ -16,11 +16,14 @@ const QRCodeSVG = require("qrcode/lib/renderer/svg-tag");
 function qrSVG(payload) {
 	return QRCodeSVG.render(QRCodeCore.create(payload, { errorCorrectionLevel: "M" }), { margin: 1 });
 }
-const { createPhoneAccessStore, createPhoneGateway, reachableAddresses } = require("./phone-access.cjs");
+const { createPhoneAccessStore, createPhoneGateway } = require("./phone-access.cjs");
+
+/** How often the open window checks the addresses (Tailscale on or off). */
+const ADDRESS_CHECK_MS = 5000;
 
 /** `electron` is injected by main.cjs (its own module objects), so test
  * harnesses that fake Electron also fake this window. */
-function createPhoneAccess({ electron, file, tlsDir, target, info, log }) {
+function createPhoneAccess({ electron, file, tlsDir, target, info, log, networkInterfaces, addressCheckMs = ADDRESS_CHECK_MS }) {
 	const { BrowserWindow, ipcMain, shell, clipboard } = electron;
 	const store = createPhoneAccessStore(file);
 	let win = null;
@@ -36,7 +39,10 @@ function createPhoneAccess({ electron, file, tlsDir, target, info, log }) {
 		currentPayload = null;
 		if (win && !win.isDestroyed()) win.webContents.send("lh:phone:pair-cancelled");
 	};
-	const gateway = createPhoneGateway({ store, target, tlsDir, info, log, onPaired, onPairingCancelled });
+	const gateway = createPhoneGateway({ store, target, tlsDir, info, log, onPaired, onPairingCancelled, networkInterfaces });
+	// While the window is open: push a new state when the addresses change.
+	let addressTimer = null;
+	let lastAddresses = "";
 	let lastError = null;
 	// The current pairing payload. Only main keeps it: "Copy pairing text"
 	// writes it to the clipboard, so the window page never holds the code.
@@ -44,13 +50,16 @@ function createPhoneAccess({ electron, file, tlsDir, target, info, log }) {
 
 	function snapshot() {
 		const state = store.read();
+		const addresses = gateway.addresses();
+		lastAddresses = JSON.stringify(addresses);
 		return {
 			enabled: state.enabled,
 			running: gateway.running(),
 			port: state.port,
 			error: lastError,
-			addresses: reachableAddresses().map((a) => ({ ...a, url: `https://${a.address}:${state.port}` })),
-			devices: state.devices.map(({ id, name, createdAt, lastSeenAt }) => ({ id, name, createdAt, lastSeenAt })),
+			addresses: addresses.map((a) => ({ ...a, url: `https://${a.address}:${state.port}` })),
+			tailscale: addresses.some((a) => a.kind === "tailscale"),
+			devices: state.devices.map(({ id, name, createdAt, lastSeenAt, tailscale }) => ({ id, name, createdAt, lastSeenAt, tailscale })),
 		};
 	}
 
@@ -138,7 +147,13 @@ function createPhoneAccess({ electron, file, tlsDir, target, info, log }) {
 			if (url.startsWith("https://")) void shell.openExternal(url);
 			return { action: "deny" };
 		});
+		addressTimer = setInterval(() => {
+			if (JSON.stringify(gateway.addresses()) !== lastAddresses) push();
+		}, addressCheckMs);
+		addressTimer.unref?.();
 		win.on("closed", () => {
+			clearInterval(addressTimer);
+			addressTimer = null;
 			currentPayload = null;
 			gateway.cancelPairing();
 			win = null;

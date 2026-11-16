@@ -56,7 +56,7 @@ function fakeElectron() {
 	};
 }
 
-function setup() {
+function setup(options: { networkInterfaces?: () => Record<string, any[]>; addressCheckMs?: number } = {}) {
 	const dir = fs.mkdtempSync(path.join(os.tmpdir(), "lh-phone-win-"));
 	const fake = fakeElectron();
 	const access = createPhoneAccess({
@@ -66,6 +66,7 @@ function setup() {
 		target: () => ({ url: "http://127.0.0.1:1" }),
 		info: { name: "Test Mac", version: "test" },
 		log: () => {},
+		...options,
 	});
 	// Port 0: never collide with a running app.
 	access.store.update((s: any) => ({ ...s, port: 0 }));
@@ -125,7 +126,7 @@ test("copied pairing text is the QR payload; the window page gets neither the co
 
 	const after = await call("lh:phone:state");
 	assert.equal(after.devices.length, 1);
-	assert.deepEqual(Object.keys(after.devices[0]).sort(), ["createdAt", "id", "lastSeenAt", "name"], "no token hash reaches the page");
+	assert.deepEqual(Object.keys(after.devices[0]).sort(), ["createdAt", "id", "lastSeenAt", "name", "tailscale"], "no token hash reaches the page");
 	await access.stop();
 });
 
@@ -186,5 +187,50 @@ test("wrong codes that cancel the code make the window drop the dead QR code", a
 	}
 	assert.ok(fake.sent.some((m) => m.channel === "lh:phone:pair-cancelled"));
 	assert.deepEqual(await call("lh:phone:copy-pairing"), { error: "Show a new QR code first." });
+	await access.stop();
+});
+
+const LAN_ONLY = () => ({ en0: [{ address: "192.168.1.20", family: "IPv4", internal: false }] });
+const WITH_TAILSCALE = () => ({ ...LAN_ONLY(), utun4: [{ address: "100.101.102.103", family: "IPv4", internal: false }] });
+
+test("the state says if the Mac has a Tailscale address, and each device says if it got one", async () => {
+	let interfaces: () => Record<string, any[]> = LAN_ONLY;
+	const { call, fake, access, phone } = setup({ networkInterfaces: () => interfaces() });
+	await call("lh:phone:set-enabled", true);
+	assert.equal((await call("lh:phone:state")).tailscale, false);
+
+	await call("lh:phone:pair");
+	await call("lh:phone:copy-pairing");
+	const { code } = JSON.parse(fake.clipboard());
+	const port = access.gateway.address().port;
+	const res = await phone(`https://127.0.0.1:${port}/phone/v1/pair`, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ code, deviceName: "Home phone" }) });
+	assert.equal(res.status, 200);
+
+	interfaces = WITH_TAILSCALE;
+	const state = await call("lh:phone:state");
+	assert.equal(state.tailscale, true);
+	assert.deepEqual(state.devices.map((d: any) => [d.name, d.tailscale]), [["Home phone", false]]);
+	assert.equal(state.devices[0].tokenHash, undefined, "the window never gets the token hash");
+	await access.stop();
+});
+
+test("the open window gets a new state when the addresses change", async () => {
+	let interfaces: () => Record<string, any[]> = LAN_ONLY;
+	const { call, fake, access, win } = setup({ networkInterfaces: () => interfaces(), addressCheckMs: 10 });
+	await call("lh:phone:set-enabled", true);
+	fake.sent.length = 0;
+	await new Promise((r) => setTimeout(r, 40));
+	assert.equal(fake.sent.filter((m) => m.channel === "lh:phone:changed").length, 0, "no push while nothing changes");
+
+	interfaces = WITH_TAILSCALE;
+	await new Promise((r) => setTimeout(r, 40));
+	const pushes = fake.sent.filter((m) => m.channel === "lh:phone:changed");
+	assert.equal(pushes.length, 1, "one push for one change");
+	assert.equal(pushes[0].value.tailscale, true);
+
+	win.close();
+	interfaces = LAN_ONLY;
+	await new Promise((r) => setTimeout(r, 40));
+	assert.equal(fake.sent.filter((m) => m.channel === "lh:phone:changed").length, 1, "no checks after the window closes");
 	await access.stop();
 });
