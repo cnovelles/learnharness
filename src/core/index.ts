@@ -22,6 +22,10 @@ export * from "./chains.ts";
 export * from "./source-organization.ts";
 export * from "./source-selection.ts";
 export * from "./source-label.ts";
+// Issue 08 (mobile fork): the chain-table rows and the usage format helpers.
+// Both are pure and node-free; the phone app imports the files directly.
+export * from "./chain-rows.ts";
+export * from "./usage-format.ts";
 export * from "./render-settings.ts";
 
 export * from "./question-core.ts";

@@ -2,8 +2,7 @@
 
 import { createContext, useContext, useLayoutEffect, useRef, useState, type DragEvent, type HTMLAttributes, type ReactNode } from "react";
 import { FolderIcon, FolderOpenIcon } from "lucide-react";
-import { canMoveFolder, folderIsEmpty, fuzzyScore, placementOf, folderEntryCheck, type SourceEntrySelection, type OrganizationAction, type SourceDirectory } from "@/src/core";
-import type { ChainSort } from "./chain-table";
+import { canMoveFolder, folderIsEmpty, fuzzyScore, placementOf, folderEntryCheck, type ChainSort, type SourceEntrySelection, type OrganizationAction, type SourceDirectory } from "@/src/core";
 import { chainRow } from "./chain-navigation";
 import { TreeCell, TreeCheckbox, TreeDisclosure, TreeGuide, TreeSeparator, treeBranchLayout, treeRowLayout } from "./tree-presentation";
 
@@ -40,22 +39,8 @@ export function SourceDragRow({ kind, id, name, enabled, children, ...props }: H
 	</RowEditing.Provider>;
 }
 
-/** Source/folder names are also searchable, including sources without nodes. */
-export function sourceNameMatches(directory: SourceDirectory | undefined, id: string, label: string | null, query: string): boolean {
-	if (!query.trim()) return true;
-	if (fuzzyScore(query, label ?? "") !== null) return true;
-	if (!directory) return false;
-	let parent = placementOf(directory.organization, id)?.folderId ?? null;
-	const seen = new Set<string>();
-	while (parent !== null && !seen.has(parent)) {
-		seen.add(parent);
-		const folder = directory.organization.folders.find((f) => f.id === parent);
-		if (!folder) break;
-		if (fuzzyScore(query, folder.name) !== null) return true;
-		parent = folder.parentId;
-	}
-	return false;
-}
+/** The source-name search lives in core (src/core/chain-rows.ts). */
+export { sourceNameMatches } from "@/src/core";
 
 /** Same Enter/blur commit and Escape cancel interaction as session titles.
  * The in-flight guard prevents Enter followed by blur from double-writing. */
