@@ -1,25 +1,13 @@
 "use client";
 
 import { useCallback, useMemo, useRef, useState, type ReactNode } from "react";
-import { CLAUDE_CODE_PROVIDER, sessionCacheHitRate, subscriptionLabels, subscriptionLabel, type cliContextWindowOf, type SessionPricing, type TurnUsage } from "@/src/core";
-import { formatTokens, formatUsd, planCostLabel, prettyModel } from "@/components/usage-format";
-import { ModelControl, catalogLimits, useModelCatalog } from "@/components/model-picker";
+import { CLAUDE_CODE_PROVIDER, catalogLimits, contextLimitForModel, formatContextMeasurement, formatTokens, formatUsd, planCostLabel, prettyModel, sessionCacheHitRate, subscriptionLabels, subscriptionLabel, type cliContextWindowOf, type SessionPricing, type TurnUsage } from "@/src/core";
+import { ModelControl, useModelCatalog } from "@/components/model-picker";
 import { usePopoverDismiss } from "@/components/popover-dismiss";
 import { INTERACTION_LAYER_Z_BASE } from "@/components/host-dialog";
 
-export function formatContextMeasurement(tokens: number | null, limit: number | null): string {
-	const numerator = tokens === null ? "?" : formatTokens(tokens);
-	return limit === null ? numerator : `${numerator} / ${formatTokens(limit)}`;
-}
-
-/** CLI aliases have no global catalog limit: only this session's matching
- * response can supply a denominator. Other providers keep their catalog join. */
-export function contextLimitForModel(model: string | undefined, limits: ReadonlyMap<string, number> | undefined,
-	cliWindow: ReturnType<typeof cliContextWindowOf> = null): number | null {
-	if (!model) return null;
-	if (model.startsWith(`${CLAUDE_CODE_PROVIDER}:`)) return cliWindow?.model === model ? cliWindow.tokens : null;
-	return limits?.get(model) ?? null;
-}
+/** The context format helpers live in core (the phone shares them). */
+export { contextLimitForModel, formatContextMeasurement } from "@/src/core";
 
 /**
  * The below-composer stats bar (wave 4 observability): the session's

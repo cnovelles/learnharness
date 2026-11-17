@@ -3,7 +3,7 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import type { ChatSettings, ModelCatalogEntry, ModelCatalogResponse, ModelsSettings, UserSettings } from "@/src/core";
 import type { ThinkingLevel } from "@earendil-works/pi-agent-core";
-import { prettyModel } from "@/components/usage-format";
+import { prettyModel } from "@/src/core";
 import { ModelMenuList, ThinkingMenuList } from "@/components/settings/model-menu";
 import { composeSlotModel } from "@/components/settings/agent-section";
 import { MenuShell } from "@/components/menu-shell";
@@ -16,13 +16,8 @@ import { useModelCatalog } from "@/components/model-catalog";
 export { useModelCatalog } from "@/components/model-catalog";
 import { defaultOrderLevel, populateLevel, THINKING_LABEL } from "@/components/thinking-default";
 
-/** provider:id → known contextWindow over the cached catalog, mirroring
- * the server's catalogContextLimits join. CLI aliases have no global
- * denominator: the stats bar uses that session's actual CLI report instead.
- * Missing limits always render usage-only, without a hardcoded fallback. */
-export function catalogLimits(catalog: Pick<ModelCatalogResponse, "models">): Map<string, number> {
-	return new Map(catalog.models.flatMap((m) => m.contextWindow === null ? [] : [[`${m.provider}:${m.id}`, m.contextWindow] as const]));
-}
+/** The catalog limits join lives in core (the phone shares it). */
+export { catalogLimits } from "@/src/core";
 
 /**
  * THE CONVERSATION MODEL CONTROL — dual-bound (owner, per-session models,
