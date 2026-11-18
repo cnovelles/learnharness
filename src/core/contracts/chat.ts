@@ -308,6 +308,9 @@ export interface ChatSummary {
 	pendingQuestion: boolean;
 	/** A practice problem is posed but not concluded. False on teaching sessions. */
 	pendingProblem: boolean;
+	/** Problems posed through a clean result (the waiting one included).
+	 * Zero on teaching sessions. */
+	problemCount: number;
 	/** Saved per-session model/thinking choices included in the list payload. */
 	settings?: ChatSettings;
 }

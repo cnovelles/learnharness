@@ -28,6 +28,7 @@ function item(overrides: Partial<ChatListItem>): ChatListItem {
 		phase: "probe",
 		pendingQuestion: false,
 		pendingProblem: false,
+		problemCount: 0,
 		busy: false,
 		compacting: false,
 		...overrides,
