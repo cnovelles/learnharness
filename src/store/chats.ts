@@ -16,7 +16,7 @@ import type { ChatStore } from "../core/ports.ts";
 import type { ChatRecord, ChatSettings, ChatSummary, ExtractionRunUsage, ImageSnapshot, PlanTree, SideChatThread, TurnUsage } from "../core/contracts.ts";
 import { CURRENT_CHAT_VERSION } from "../core/contracts.ts";
 import type { LhMessage } from "../core/native-messages.ts";
-import { activeProblemOf, danglingQuestionOf } from "../core/native-messages.ts";
+import { activeProblemOf, danglingQuestionOf, problemCountOf } from "../core/native-messages.ts";
 import { phaseAt3Lh } from "../core/phases.ts";
 import { removeLeftoverTemps, writeFileAtomicSync } from "./atomic-write.ts";
 
@@ -113,6 +113,9 @@ function listChats(): ChatSummary[] {
 						// "Problem waiting"); false on teaching sessions, which
 						// have no problem tool.
 						pendingProblem: activeProblemOf(messages) !== null,
+						// Practice: all problems posed through a clean result (the
+						// phone's Practice tab count; done = this, less the waiting one).
+						problemCount: problemCountOf(messages),
 					};
 				} catch (err) {
 					console.error(`[chat ${summary.id}] summary projection failed:`, err);

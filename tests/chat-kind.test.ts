@@ -113,29 +113,44 @@ describe("session kind (practice sessions, 2026-10-04)", () => {
 		const listed = chatStore.listChats().find((c) => c.id === chat.id);
 		assert.equal(listed?.kind, "teach");
 		assert.equal(listed?.pendingProblem, false);
+		assert.equal(listed?.problemCount, 0);
 		assert.equal("pendingProblem" in chatStore.getChat(chat.id)!, false);
+		assert.equal("problemCount" in chatStore.getChat(chat.id)!, false);
 	});
 
 	const pose = () => practicePair(PRACTICE_PROBLEM_TOOL, "p1");
 	const conclude = () => practicePair(PRACTICE_CONCLUDE_TOOL, "c1");
-	const cases: Array<{ name: string; messages: LhMessage[]; pending: boolean }> = [
-		{ name: "thinking keeps the posed problem waiting", messages: [...pose(), newThinkingMessage("p1", "My attempt")], pending: true },
-		{ name: "a clean conclusion clears the waiting status", messages: [...pose(), ...conclude()], pending: false },
-		{ name: "dismissal clears the stored waiting status before conclusion synthesis", messages: [...pose(), newProblemDismissedMarker("p1")], pending: false },
-		{ name: "a failed pose never waits for input", messages: practicePair(PRACTICE_PROBLEM_TOOL, "p1", true), pending: false },
-		{ name: "a dangling pose never waits for input", messages: pose().slice(0, 1), pending: false },
-		{ name: "a failed conclusion keeps the problem waiting", messages: [...pose(), ...practicePair(PRACTICE_CONCLUDE_TOOL, "c1", true)], pending: true },
-		{ name: "a dangling conclusion keeps the problem waiting", messages: [...pose(), ...conclude().slice(0, 1)], pending: true },
-		{ name: "a rejected newer pose leaves the prior problem waiting", messages: [...pose(), ...practicePair(PRACTICE_PROBLEM_TOOL, "p2", true)], pending: true },
-		{ name: "a new problem after a conclusion waits again", messages: [...pose(), ...conclude(), ...practicePair(PRACTICE_PROBLEM_TOOL, "p2")], pending: true },
+	// problems: the problemCount of the list row (clean poses, the waiting one included).
+	const cases: Array<{ name: string; messages: LhMessage[]; pending: boolean; problems: number }> = [
+		{ name: "thinking keeps the posed problem waiting", messages: [...pose(), newThinkingMessage("p1", "My attempt")], pending: true, problems: 1 },
+		{ name: "a clean conclusion clears the waiting status", messages: [...pose(), ...conclude()], pending: false, problems: 1 },
+		{ name: "dismissal clears the stored waiting status before conclusion synthesis", messages: [...pose(), newProblemDismissedMarker("p1")], pending: false, problems: 1 },
+		{ name: "a failed pose never waits for input", messages: practicePair(PRACTICE_PROBLEM_TOOL, "p1", true), pending: false, problems: 0 },
+		{ name: "a dangling pose never waits for input", messages: pose().slice(0, 1), pending: false, problems: 0 },
+		{ name: "a failed conclusion keeps the problem waiting", messages: [...pose(), ...practicePair(PRACTICE_CONCLUDE_TOOL, "c1", true)], pending: true, problems: 1 },
+		{ name: "a dangling conclusion keeps the problem waiting", messages: [...pose(), ...conclude().slice(0, 1)], pending: true, problems: 1 },
+		{ name: "a rejected newer pose leaves the prior problem waiting", messages: [...pose(), ...practicePair(PRACTICE_PROBLEM_TOOL, "p2", true)], pending: true, problems: 1 },
+		{ name: "a new problem after a conclusion waits again", messages: [...pose(), ...conclude(), ...practicePair(PRACTICE_PROBLEM_TOOL, "p2")], pending: true, problems: 2 },
+		{
+			name: "three concluded problems and a fourth that waits",
+			messages: [
+				...pose(), ...conclude(),
+				...practicePair(PRACTICE_PROBLEM_TOOL, "p2"), ...practicePair(PRACTICE_CONCLUDE_TOOL, "c2"),
+				...practicePair(PRACTICE_PROBLEM_TOOL, "p3"), newProblemDismissedMarker("p3"),
+				...practicePair(PRACTICE_PROBLEM_TOOL, "p4"),
+			],
+			pending: true,
+			problems: 4,
+		},
 	];
 
-	for (const { name, messages, pending } of cases) {
+	for (const { name, messages, pending, problems } of cases) {
 		it(`the list projection: ${name}`, () => {
 			const chat = chatStore.createChat(name, "practice");
 			chatStore.saveMessages(chat.id, messages);
 			const listed = chatStore.listChats().find((c) => c.id === chat.id);
 			assert.equal(listed?.pendingProblem, pending);
+			assert.equal(listed?.problemCount, problems);
 			assert.equal(listed?.pendingQuestion, false, "practice status does not manufacture a teaching question");
 		});
 	}

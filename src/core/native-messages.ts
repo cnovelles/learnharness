@@ -540,6 +540,25 @@ export function activeProblemOf(
 	return active ? { toolCallId: active.occurrence.toolCallId, input: active.input, ...(active.pluginProblem ? { pluginProblem: active.pluginProblem } : {}) } : null;
 }
 
+/** The number of problems posed in a practice session: the poses that went
+ *  through (a clean result), by the same rule as activeProblemOf. The count
+ *  includes the problem that waits now; errored and dangling poses do not
+ *  count. The phone's Practice tab shows it on each row (issue 20 slice C). */
+export function problemCountOf(messages: readonly LhMessage[]): number {
+	const cleanCallIds = cleanToolCallIds(messages);
+	let count = 0;
+	for (const m of messages) {
+		if ((m as { role?: string }).role !== "assistant") continue;
+		const assistant = m as AssistantMessage & { id: string };
+		assistant.content.forEach((block, bi) => {
+			if (block.type !== "toolCall" || !cleanCallIds.has(block.id)) return;
+			const occurrence = { messageId: m.id, contentIndex: bi, toolCallId: block.id, toolName: block.name };
+			if (practiceProblemForCall(messages, occurrence)) count++;
+		});
+	}
+	return count;
+}
+
 /** Exact source of the same clean activation selected by activeProblemOf. */
 export function activeProblemOccurrenceOf(messages: readonly LhMessage[]): PluginSubmissionOccurrence | null {
 	return activeProblemCallOf(messages)?.occurrence ?? null;
