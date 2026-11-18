@@ -3,7 +3,7 @@
 import { createContext, useContext, useLayoutEffect, useRef, useState, type DragEvent, type HTMLAttributes, type ReactNode } from "react";
 import { FolderIcon, FolderOpenIcon } from "lucide-react";
 import { cn } from "@/lib/utils";
-import { canMoveFolder, folderIsEmpty, fuzzyScore, placementOf, folderEntryCheck, type ChainSort, type SourceEntrySelection, type OrganizationAction, type SourceDirectory } from "@/src/core";
+import { canMoveFolder, folderIsEmpty, folderEntryCheck, folderTree, type ChainSort, type SourceEntrySelection, type OrganizationAction, type SourceDirectory } from "@/src/core";
 import { chainRow } from "./chain-navigation";
 import { TreeCell, TreeCheckbox, TreeDisclosure, TreeGuide, TreeSeparator, treeBranchLayout, treeRowLayout } from "./tree-presentation";
 
@@ -103,22 +103,7 @@ export function SourceFolderTree<T extends TreeSource>({ groups, directory, quer
 	const state = directory.organization;
 	const ids = new Set(directory.sources.map((s) => s.id));
 	const search = query.trim() !== "";
-	const collator = new Intl.Collator(undefined, { sensitivity: "base", numeric: true });
-	const parentOf = (g: Pick<T, "birth">) => g.birth === null ? null : placementOf(state, g.birth)?.folderId ?? null;
-	const isDescendant = (g: Pick<T, "birth">, folderId: string): boolean => {
-		let parent = parentOf(g);
-		while (parent !== null) {
-			if (parent === folderId) return true;
-			parent = state.folders.find((f) => f.id === parent)?.parentId ?? null;
-		}
-		return false;
-	};
-	const nodeIds = (folderId: string) => [...new Set(allSourceNodes
-		? [...allSourceNodes].filter(([birth]) => isDescendant({ birth }, folderId)).flatMap(([, nodes]) => [...nodes])
-		: groups.filter((g) => isDescendant(g, folderId)).flatMap((g) => g.nodeIds))];
-	const visibleFolder = (id: string): boolean => !search || groups.some((g) => isDescendant(g, id))
-		|| state.folders.some((f) => f.id === id && fuzzyScore(query, f.name) !== null)
-		|| state.folders.some((f) => f.parentId === id && visibleFolder(f.id));
+	const tree = folderTree({ groups, organization: state, query, sort, allSourceNodes });
 	const dropProps = (parentId: string | null) => onAction ? {
 		onDragOver(event: DragEvent) {
 			if (!Array.from(event.dataTransfer.types).includes(DRAG_TYPE)) return;
@@ -146,23 +131,16 @@ export function SourceFolderTree<T extends TreeSource>({ groups, directory, quer
 		},
 	} : {};
 	const renderLevel = (parentId: string | null, depth: number): ReactNode => {
-		const items = [
-			...groups.filter((g) => parentOf(g) === parentId).map((g) => ({ kind: "source" as const, source: g, id: g.key, name: g.label ?? "\uffff", count: g.nodeIds.length, date: g.newestCreatedAt })),
-			...state.folders.filter((f) => f.parentId === parentId && visibleFolder(f.id)).map((f) => ({ kind: "folder" as const, folder: f, id: f.id, name: f.name, count: nodeIds(f.id).length, date: f.createdAt })),
-		];
-		items.sort((a, b) => {
-			const byName = collator.compare(a.name, b.name);
-			return (sort.col === "name" ? byName : sort.col === "props" ? a.count - b.count : a.date.localeCompare(b.date)) * sort.dir || byName || a.id.localeCompare(b.id);
-		});
+		const items = tree.level(parentId);
 		return items.map((item) => {
 			if (item.kind === "source") return <div key={item.id} {...dropProps(parentId)}>{renderSource(item.source, depth)}</div>;
 			const folder = item.folder;
 			const open = search ? !collapsedForSearch?.has(folder.id) : expanded.has(folder.id);
-			const members = nodeIds(folder.id);
+			const members = tree.folderNodeIds(folder.id);
 			const empty = folderIsEmpty(state, folder.id, ids);
 			const selectedCount = members.filter((id) => selection.has(id)).length;
 			const entryCheck = sourceSelection ? folderEntryCheck(directory, folder.id, sourceSelection) : undefined;
-			const hasChildren = state.folders.some((f) => f.parentId === folder.id && visibleFolder(f.id)) || groups.some((g) => parentOf(g) === folder.id);
+			const hasChildren = tree.hasChildren(folder.id);
 			return <div key={folder.id} data-testid={`source-folder-${folder.id}`} {...treeBranchLayout()} {...dropProps(folder.id)}>
 				<SourceDragRow {...chainRow(["folder", folder.id], depth, open)} kind="folder" id={folder.id} name={folder.name} enabled={Boolean(onAction)} data-testid={`folder-row-${folder.id}`}
 					data-drop-active={dropTarget === folder.id}
