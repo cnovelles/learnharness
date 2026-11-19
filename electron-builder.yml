@@ -68,6 +68,9 @@ files:
   - node_modules/electron-updater/**/*
   - node_modules/fs-extra/**/*
   - node_modules/js-yaml/**/*
+  # Mobile fork: phone access pairing QR (core + SVG renderer only).
+  - node_modules/qrcode/**/*
+  - node_modules/dijkstrajs/**/*
   - node_modules/lazy-val/**/*
   - node_modules/lodash.escaperegexp/**/*
   - node_modules/lodash.isequal/**/*

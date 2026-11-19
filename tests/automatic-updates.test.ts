@@ -13,7 +13,7 @@ const mainFile = fileURLToPath(new URL("../electron/main.cjs", import.meta.url))
 const mainSource = readFileSync(mainFile, "utf8");
 const mainRequire = createRequire(mainFile);
 
-function fixture({ packaged = true, updaterMissing = false } = {}) {
+function fixture({ packaged = true, updaterMissing = false, forkUpdates = true } = {}) {
 	let settings: string | Error = JSON.stringify({ version: 1, general: { autoUpdate: true } });
 	const settingsReads: string[] = [];
 	const order: string[] = [];
@@ -104,7 +104,8 @@ function fixture({ packaged = true, updaterMissing = false } = {}) {
 			};
 			return mainRequire(id);
 		},
-		process: { argv: [], env: { LH_DEV_URL: "http://127.0.0.1:9000" }, platform: "darwin", on() {} },
+		// Mobile fork: upstream updates are off by default; this suite covers the upstream updater code.
+		process: { argv: [], env: { LH_DEV_URL: "http://127.0.0.1:9000", ...(forkUpdates ? { LH_FORK_UPSTREAM_UPDATES: "1" } : {}) }, platform: "darwin", on() {} },
 		__dirname: path.dirname(mainFile), URL, AbortController,
 		setInterval: (callback: () => void, delay: number) => intervals.push({ callback, delay }),
 		setTimeout() {},
@@ -121,6 +122,7 @@ function fixture({ packaged = true, updaterMissing = false } = {}) {
 		state: () => JSON.parse(JSON.stringify(run("updateState"))),
 		check: async (manual = false) => { run(`checkForUpdates({ manual: ${manual} })`); await Promise.resolve(); await Promise.resolve(); },
 		menuCheck: () => menu[0]!.submenu!.find(item => item.label === "Check for Updates…")!.click!(),
+		menuLabels: () => menu[0]!.submenu!.map(item => item.label),
 	};
 }
 
@@ -299,5 +301,21 @@ describe("startup, timer, trusted IPC and menu wiring", () => {
 		const f = fixture(); f.setSettings({ general: { autoUpdate: false } }); await f.run("main()");
 		f.windows[0]!.webContents.fails = true; f.windows[0]!.webContents.loading = false;
 		f.menuCheck(); assert.equal(f.updater.checks, 1);
+	});
+});
+
+describe("mobile fork", () => {
+	it("upstream auto-update is off by default: no check, status disabled, no settings read", async () => {
+		const f = fixture({ forkUpdates: false });
+		f.run("setupAutoUpdater()"); await f.check(true); await f.check();
+		assert.equal(f.updater.checks, 0);
+		assert.equal(f.settingsReads.length, 0);
+		assert.equal(f.state().status, "disabled");
+	});
+
+	it("the app menu has Phone Access", () => {
+		const f = fixture();
+		f.run("installMenu()");
+		assert(f.menuLabels().includes("Phone Access…"));
 	});
 });
