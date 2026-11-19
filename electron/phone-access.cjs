@@ -11,7 +11,8 @@
  *    from the pairing QR code, and sends nothing to a server that fails it.
  *  - Each request must carry a device token from QR pairing.
  *  - Only an allowlist of chat/graph routes passes. Keys, subscriptions,
- *    providers, prompts and settings writes stay desktop-only.
+ *    providers, prompts and settings writes stay desktop-only. The folder
+ *    writes pass only through the checks of PHONE_WRITES.
  *  - Allowed requests stream to the loopback server with the desktop
  *    capability header added here. The server code is unchanged.
  *
@@ -56,9 +57,74 @@ const ROUTES = [
 	{ methods: ["GET"], pattern: /^\/api\/stt\/token$/ },
 ];
 
+/** Folder ids and names: at most this many characters. */
+const MAX_FOLDER_TEXT = 200;
+/** The gateway refuses a new folder when the Mac already has this many. */
+const MAX_FOLDERS = 500;
+const CONTROL_CHARS = /[\u0000-\u001f\u007f-\u009f\u2028\u2029]/;
+/** The keys of each folder action (fork src/core/source-organization.ts). */
+const FOLDER_ACTION_KEYS = {
+	"create-folder": ["action", "name", "parentId"],
+	"rename-folder": ["action", "id", "name"],
+	"rename-source": ["action", "id", "name"],
+	move: ["action", "kind", "id", "parentId"],
+	"delete-folder": ["action", "id"],
+};
+
+const isText = (value) => typeof value === "string" && value.length <= MAX_FOLDER_TEXT && !CONTROL_CHARS.test(value);
+
+/** The error for a folder action that the gateway refuses, or null. The
+ * server checks the meaning (the folder exists, no cycle, empty delete);
+ * this checks the shape and the sizes. */
+function checkFolderAction(body) {
+	if (!body || typeof body !== "object" || Array.isArray(body)) return "The folder change is not valid.";
+	const keys = Object.hasOwn(FOLDER_ACTION_KEYS, body.action) ? FOLDER_ACTION_KEYS[body.action] : null;
+	if (!keys) return "The folder change is not valid.";
+	const given = Object.keys(body);
+	if (given.length !== keys.length || !keys.every((key) => Object.hasOwn(body, key))) return "The folder change is not valid.";
+	if ("id" in body && !(isText(body.id) && body.id.length > 0)) return "The folder change is not valid.";
+	if ("parentId" in body && body.parentId !== null && !(isText(body.parentId) && body.parentId.length > 0)) return "The folder change is not valid.";
+	if ("kind" in body && body.kind !== "source" && body.kind !== "folder") return "The folder change is not valid.";
+	if ("name" in body) {
+		if (typeof body.name !== "string" || !body.name.trim()) return "Enter a name.";
+		if (!isText(body.name.trim()) || CONTROL_CHARS.test(body.name)) return `Use a name of at most ${MAX_FOLDER_TEXT} characters, on one line.`;
+	}
+	return null;
+}
+
+/**
+ * The only writes that a phone can send with a body that the gateway checks.
+ * To add, change or remove a phone write, change this table only. The
+ * gateway reads the body (at most `maxBytes`), parses it as JSON, calls
+ * `check` and `limit`, and sends the checked body to the server. Audit:
+ * learnharness-mobile docs/TRANSPORT-SECURITY.md "Gateway writes" (D-015).
+ */
+const PHONE_WRITES = [
+	{
+		method: "POST",
+		pattern: /^\/api\/graph\/sources$/,
+		maxBytes: 4 * 1024,
+		check: checkFolderAction,
+		/** Reads the folder list only before a new folder. */
+		limit: async (body, readJSON) => {
+			if (body.action !== "create-folder") return null;
+			const directory = await readJSON("/api/graph/sources");
+			const count = Array.isArray(directory?.organization?.folders) ? directory.organization.folders.length : 0;
+			return count >= MAX_FOLDERS ? { status: 409, error: `This Mac has the most folders it can keep (${MAX_FOLDERS}). Delete a folder first.`, code: "folder-limit" } : null;
+		},
+	},
+];
+
+const safePath = (pathname) => typeof pathname === "string" && !pathname.includes("..") && !pathname.includes("//");
+
+function phoneWriteFor(method, pathname) {
+	if (!safePath(pathname)) return null;
+	return PHONE_WRITES.find((write) => write.method === method && write.pattern.test(pathname)) ?? null;
+}
+
 function phoneRouteAllowed(method, pathname) {
-	if (typeof pathname !== "string" || pathname.includes("..") || pathname.includes("//")) return false;
-	return ROUTES.some((route) => route.pattern.test(pathname) && route.methods.includes(method));
+	if (!safePath(pathname)) return false;
+	return ROUTES.some((route) => route.pattern.test(pathname) && route.methods.includes(method)) || phoneWriteFor(method, pathname) !== null;
 }
 
 const hashToken = (token) => crypto.createHash("sha256").update(token, "utf8").digest("hex");
@@ -127,15 +193,21 @@ function sendJSON(res, status, body) {
 	res.end(text);
 }
 
-function readJSONBody(req, limit = 64 * 1024) {
+/** @param {boolean} [destroyOnOverflow] false: pause the request instead, so
+ * the caller can answer 413 first and then close the connection. */
+function readJSONBody(req, limit = 64 * 1024, destroyOnOverflow = true) {
 	return new Promise((resolve, reject) => {
 		const chunks = [];
 		let size = 0;
+		let over = false;
 		req.on("data", (chunk) => {
+			if (over) return;
 			size += chunk.length;
 			if (size > limit) {
+				over = true;
 				reject(Object.assign(new Error("body too large"), { status: 413 }));
-				req.destroy();
+				if (destroyOnOverflow) req.destroy();
+				else req.pause();
 				return;
 			}
 			chunks.push(chunk);
@@ -309,13 +381,73 @@ function createPhoneGateway({ store, target, tlsDir, info = {}, log = () => {}, 
 		};
 	}
 
-	function proxy(req, res, url, device) {
+	/** GET a JSON answer from the loopback server (for a write's `limit`). */
+	function readUpstreamJSON(pathname) {
+		const { url: base, secret } = target();
+		const upstreamURL = new URL(pathname, base);
+		const headers = { accept: "application/json", host: upstreamURL.host };
+		if (secret) headers[DESKTOP_HEADER] = secret;
+		return new Promise((resolve, reject) => {
+			const request = http.get(upstreamURL, { headers }, (upRes) => {
+				const chunks = [];
+				upRes.on("data", (chunk) => chunks.push(chunk));
+				upRes.on("end", () => {
+					if ((upRes.statusCode ?? 500) >= 400) return reject(new Error(`upstream ${upRes.statusCode}`));
+					try {
+						resolve(JSON.parse(Buffer.concat(chunks).toString("utf8")));
+					} catch {
+						reject(new Error("upstream answer is not JSON"));
+					}
+				});
+				upRes.on("error", reject);
+			});
+			request.on("error", reject);
+		});
+	}
+
+	/** A write from PHONE_WRITES: read and check the body here, then send
+	 * the checked body. A refused body never reaches the server. */
+	async function handleWrite(req, res, url, device, write) {
+		// A refusal before the read answers first, then closes: the body is never read.
+		const refuse = (status, error) => {
+			res.setHeader("Connection", "close");
+			res.on("finish", () => req.destroy());
+			return sendJSON(res, status, { error });
+		};
+		const type = String(req.headers["content-type"] ?? "").split(";")[0].trim().toLowerCase();
+		if (type !== "application/json") return refuse(415, "The request must be JSON.");
+		if (Number(req.headers["content-length"] ?? 0) > write.maxBytes) return refuse(413, "Request body too large.");
+		let body;
+		try {
+			body = await readJSONBody(req, write.maxBytes, false);
+		} catch (err) {
+			return err.status === 413 ? refuse(413, "Request body too large.") : sendJSON(res, 400, { error: "The request must be JSON." });
+		}
+		const problem = write.check(body);
+		if (problem) return sendJSON(res, 400, { error: problem });
+		let refusal;
+		try {
+			refusal = await write.limit(body, readUpstreamJSON);
+		} catch (err) {
+			log(`phone access: write limit check failed: ${err.message}`);
+			return sendJSON(res, 502, { error: "The LearnHarness server is not reachable." });
+		}
+		if (refusal) return sendJSON(res, refusal.status, { error: refusal.error, code: refusal.code });
+		proxy(req, res, url, device, Buffer.from(JSON.stringify(body), "utf8"));
+	}
+
+	/** @param {Buffer} [body] a body that the gateway already read and checked */
+	function proxy(req, res, url, device, body) {
 		const { url: base, secret } = target();
 		const upstreamURL = new URL(url.pathname + url.search, base);
 		const headers = {};
 		for (const name of FORWARD_HEADERS) if (req.headers[name] !== undefined) headers[name] = req.headers[name];
+		if (body) {
+			headers["content-type"] = "application/json";
+			headers["content-length"] = String(body.length);
+		}
 		const declared = Number(req.headers["content-length"] ?? 0);
-		if (declared > MAX_BODY_BYTES) return sendJSON(res, 413, { error: "Request body too large." });
+		if (!body && declared > MAX_BODY_BYTES) return sendJSON(res, 413, { error: "Request body too large." });
 		if (secret) headers[DESKTOP_HEADER] = secret;
 		headers.host = upstreamURL.host;
 		const upstream = http.request(upstreamURL, { method: req.method, headers }, (upRes) => {
@@ -338,6 +470,10 @@ function createPhoneGateway({ store, target, tlsDir, info = {}, log = () => {}, 
 			untrack();
 			if (!res.writableFinished) closeUpstream(upstream);
 		});
+		if (body) {
+			upstream.end(body);
+			return;
+		}
 		let size = 0;
 		req.on("data", (chunk) => {
 			size += chunk.length;
@@ -364,6 +500,8 @@ function createPhoneGateway({ store, target, tlsDir, info = {}, log = () => {}, 
 			return sendJSON(res, 200, { ok: true, protocol: PROTOCOL, deviceId: device.id, server: { name: info.name ?? os.hostname(), version: info.version ?? null } });
 		}
 		if (!phoneRouteAllowed(req.method ?? "GET", url.pathname)) return sendJSON(res, 403, { error: "This action is available only on the desktop." });
+		const write = phoneWriteFor(req.method ?? "GET", url.pathname);
+		if (write) return handleWrite(req, res, url, device, write);
 		proxy(req, res, url, device);
 	}
 
@@ -426,7 +564,11 @@ module.exports = {
 	createPhoneAccessStore,
 	createPhoneGateway,
 	phoneRouteAllowed,
+	phoneWriteFor,
+	checkFolderAction,
 	reachableAddresses,
+	MAX_FOLDERS,
+	MAX_FOLDER_TEXT,
 	hashToken,
 	DEFAULT_PORT,
 	PAIRING_TTL_MS,

@@ -10,7 +10,7 @@ import type { AddressInfo } from "node:net";
 import { PinMismatchError, pinnedFetch } from "./helpers/pinned-fetch.ts";
 
 const require = createRequire(import.meta.url);
-const { createPhoneAccessStore, createPhoneGateway, phoneRouteAllowed, reachableAddresses, hashToken, PAIRING_TTL_MS, PROTOCOL } = require("../electron/phone-access.cjs");
+const { createPhoneAccessStore, createPhoneGateway, phoneRouteAllowed, phoneWriteFor, checkFolderAction, reachableAddresses, hashToken, PAIRING_TTL_MS, PROTOCOL, MAX_FOLDERS, MAX_FOLDER_TEXT } = require("../electron/phone-access.cjs");
 const { createCertificate, loadOrCreateCertificate, spkiPin, checkPair } = require("../electron/phone-access-tls.cjs");
 
 
@@ -41,6 +41,8 @@ test("allowlist passes the phone's chat, stream, event and read routes", () => {
 		["GET", "/api/graph"],
 		["GET", "/api/graph/status"],
 		["GET", "/api/stt/token"],
+		["GET", "/api/graph/sources"],
+		["POST", "/api/graph/sources"],
 	]) assert.equal(phoneRouteAllowed(method, p), true, `${method} ${p}`);
 });
 
@@ -63,11 +65,65 @@ test("allowlist refuses credentials, providers, prompts, settings writes, delete
 		["POST", "/api/graph/import"],
 		["DELETE", "/api/graph/nodes/n1"],
 		["PUT", "/api/graph/positions"],
+		["DELETE", "/api/graph/sources"],
+		["PUT", "/api/graph/sources"],
+		["POST", "/api/graph/sources/../import"],
 		["GET", "/api/chats/../keys"],
 		["GET", "/api/chats//stream"],
 		["GET", "/"],
 		["GET", "/chat/new"],
 	]) assert.equal(phoneRouteAllowed(method, p), false, `${method} ${p}`);
+});
+
+// ─── Unit: phone writes (D-015) ──────────────────────────────────────────
+
+test("phone writes: only POST /api/graph/sources has a checked body", () => {
+	assert.ok(phoneWriteFor("POST", "/api/graph/sources"));
+	assert.equal(phoneWriteFor("DELETE", "/api/graph/sources"), null);
+	assert.equal(phoneWriteFor("POST", "/api/chat"), null);
+	assert.equal(phoneWriteFor("POST", "/api/graph//sources"), null);
+});
+
+test("folder check: the 5 actions with their exact keys pass", () => {
+	for (const body of [
+		{ action: "create-folder", name: "Databases", parentId: null },
+		{ action: "create-folder", name: "Postgres", parentId: "folder_1" },
+		{ action: "rename-folder", id: "folder_1", name: "Data" },
+		{ action: "rename-source", id: "chat_1", name: "SQL joins" },
+		{ action: "move", kind: "source", id: "chat_1", parentId: "folder_1" },
+		{ action: "move", kind: "folder", id: "folder_2", parentId: null },
+		{ action: "delete-folder", id: "folder_1" },
+		{ action: "rename-folder", id: "folder_1", name: "x".repeat(MAX_FOLDER_TEXT) },
+		{ action: "rename-folder", id: "folder_1", name: "  Data  " },
+	]) assert.equal(checkFolderAction(body), null, JSON.stringify(body));
+});
+
+test("folder check: wrong shapes, extra keys, long or multi-line names are refused", () => {
+	for (const body of [
+		null,
+		[],
+		"create-folder",
+		{},
+		{ action: "delete-sources", id: "chat_1" },
+		{ action: "__proto__", id: "x" },
+		{ action: "create-folder", name: "A" },
+		{ action: "create-folder", name: "A", parentId: null, extra: 1 },
+		{ action: "create-folder", name: "", parentId: null },
+		{ action: "create-folder", name: "   ", parentId: null },
+		{ action: "create-folder", name: 5, parentId: null },
+		{ action: "create-folder", name: "A", parentId: 3 },
+		{ action: "create-folder", name: "A", parentId: "" },
+		{ action: "create-folder", name: "x".repeat(MAX_FOLDER_TEXT + 1), parentId: null },
+		{ action: "create-folder", name: "two\nlines", parentId: null },
+		{ action: "create-folder", name: "tab\there", parentId: null },
+		{ action: "create-folder", name: "sep\u2028here", parentId: null },
+		{ action: "rename-folder", id: "", name: "A" },
+		{ action: "rename-folder", id: "f".repeat(MAX_FOLDER_TEXT + 1), name: "A" },
+		{ action: "rename-folder", id: "bad\u0000id", name: "A" },
+		{ action: "move", kind: "chat", id: "chat_1", parentId: null },
+		{ action: "move", id: "chat_1", parentId: null },
+		{ action: "delete-folder", id: "folder_1", parentId: null },
+	]) assert.notEqual(checkFolderAction(body), null, JSON.stringify(body));
 });
 
 // ─── Unit: store ─────────────────────────────────────────────────────────
@@ -534,6 +590,154 @@ test("the gateway lists the addresses of the network interfaces it is given", as
 	const h = await harness({ networkInterfaces: WITH_TAILSCALE });
 	try {
 		assert.deepEqual(h.gateway.addresses().map((a: any) => a.kind), ["tailscale", "lan"]);
+	} finally {
+		await h.close();
+	}
+});
+
+// ─── Integration: phone writes (D-015) ───────────────────────────────────
+
+function folderUpstream(folderCount: number, seen: Seen[]): http.RequestListener {
+	return (req, res) => {
+		const chunks: Buffer[] = [];
+		req.on("data", (c) => chunks.push(c));
+		req.on("end", () => {
+			seen.push({ method: req.method!, url: req.url!, headers: req.headers, body: Buffer.concat(chunks).toString() });
+			res.writeHead(200, { "Content-Type": "application/json" });
+			if (req.method === "GET") {
+				const folders = Array.from({ length: folderCount }, (_, i) => ({ id: `folder_${i}`, name: `F${i}`, parentId: null, createdAt: "2026-11-18T00:00:00.000Z" }));
+				res.end(JSON.stringify({ organization: { version: 1, folders, placements: {} }, sources: [] }));
+			} else res.end(JSON.stringify({ ok: true }));
+		});
+	};
+}
+
+async function folderWrite(h: Awaited<ReturnType<typeof harness>>, token: string, body: string, headers: Record<string, string> = {}) {
+	return h.fetch(`${h.base}/api/graph/sources`, { method: "POST", headers: { authorization: `Bearer ${token}`, "content-type": "application/json", ...headers }, body });
+}
+
+test("phone writes: each folder action reaches the server as checked JSON with the desktop secret", async () => {
+	const seen: Seen[] = [];
+	const h = await harness({ upstream: folderUpstream(3, seen) });
+	try {
+		const token = await pairedToken(h);
+		const actions = [
+			{ action: "create-folder", name: "Databases", parentId: null },
+			{ action: "rename-folder", id: "folder_1", name: "Data" },
+			{ action: "rename-source", id: "chat_1", name: "SQL joins" },
+			{ action: "move", kind: "source", id: "chat_1", parentId: "folder_1" },
+			{ action: "delete-folder", id: "folder_1" },
+		];
+		for (const action of actions) {
+			const res = await folderWrite(h, token, JSON.stringify(action));
+			assert.equal(res.status, 200, action.action);
+			await res.text();
+		}
+		const posts = seen.filter((r) => r.method === "POST");
+		assert.equal(posts.length, 5);
+		assert.deepEqual(posts.map((r) => JSON.parse(r.body)), actions);
+		for (const r of posts) {
+			assert.equal(r.url, "/api/graph/sources");
+			assert.equal(r.headers["x-learnharness-desktop"], SECRET);
+			assert.equal(r.headers["content-type"], "application/json");
+			assert.equal(Number(r.headers["content-length"]), Buffer.byteLength(r.body));
+			assert.equal(r.headers.authorization, undefined);
+		}
+		// Only the new folder reads the folder list first.
+		const gets = seen.filter((r) => r.method === "GET");
+		assert.equal(gets.length, 1);
+		assert.equal(gets[0]!.url, "/api/graph/sources");
+		assert.equal(gets[0]!.headers["x-learnharness-desktop"], SECRET);
+	} finally {
+		await h.close();
+	}
+});
+
+test("phone writes: bad bodies are refused and never reach the server", async () => {
+	const seen: Seen[] = [];
+	const h = await harness({ upstream: folderUpstream(0, seen) });
+	try {
+		const token = await pairedToken(h);
+		const cases: Array<[string, Record<string, string>, number]> = [
+			[JSON.stringify({ action: "delete-sources", ids: ["chat_1"] }), {}, 400],
+			[JSON.stringify({ action: "create-folder", name: "A", parentId: null, extra: true }), {}, 400],
+			[JSON.stringify({ action: "rename-folder", id: "folder_1", name: "x".repeat(MAX_FOLDER_TEXT + 1) }), {}, 400],
+			[JSON.stringify({ action: "rename-folder", id: "folder_1", name: "a\nb" }), {}, 400],
+			["{not json", {}, 400],
+			[JSON.stringify({ action: "create-folder", name: "A", parentId: null }), { "content-type": "text/plain" }, 415],
+			[JSON.stringify({ action: "rename-folder", id: "folder_1", name: "A", pad: "x".repeat(5000) }), {}, 413],
+		];
+		for (const [body, headers, status] of cases) {
+			const res = await folderWrite(h, token, body, headers);
+			assert.equal(res.status, status, body.slice(0, 60));
+			const answer = await res.json();
+			assert.equal(typeof answer.error, "string");
+		}
+		const del = await h.fetch(`${h.base}/api/graph/sources`, { method: "DELETE", headers: { authorization: `Bearer ${token}`, "content-type": "application/json" }, body: JSON.stringify({ ids: ["chat_1"] }) });
+		assert.equal(del.status, 403);
+		await del.text();
+		assert.equal(seen.length, 0);
+	} finally {
+		await h.close();
+	}
+});
+
+test("phone writes: a body over the limit with a wrong content-length is refused", async () => {
+	const seen: Seen[] = [];
+	const h = await harness({ upstream: folderUpstream(0, seen) });
+	try {
+		const token = await pairedToken(h);
+		const big = JSON.stringify({ action: "rename-folder", id: "folder_1", name: "x".repeat(6000) });
+		const res = await new Promise<number>((resolve, reject) => {
+			const req = require("node:https").request(`${h.base}/api/graph/sources`, {
+				method: "POST",
+				rejectUnauthorized: false,
+				headers: { authorization: `Bearer ${token}`, "content-type": "application/json", "transfer-encoding": "chunked" },
+			}, (r: http.IncomingMessage) => { r.resume(); resolve(r.statusCode!); });
+			req.on("error", reject);
+			req.write(big.slice(0, 3000));
+			req.end(big.slice(3000));
+		});
+		assert.equal(res, 413);
+		assert.equal(seen.length, 0);
+	} finally {
+		await h.close();
+	}
+});
+
+test(`phone writes: a new folder is refused at ${MAX_FOLDERS} folders; other actions still pass`, async () => {
+	const seen: Seen[] = [];
+	const h = await harness({ upstream: folderUpstream(MAX_FOLDERS, seen) });
+	try {
+		const token = await pairedToken(h);
+		const create = await folderWrite(h, token, JSON.stringify({ action: "create-folder", name: "One more", parentId: null }));
+		assert.equal(create.status, 409);
+		assert.equal((await create.json()).code, "folder-limit");
+		assert.equal(seen.filter((r) => r.method === "POST").length, 0);
+		const rename = await folderWrite(h, token, JSON.stringify({ action: "rename-folder", id: "folder_1", name: "Data" }));
+		assert.equal(rename.status, 200);
+		await rename.text();
+	} finally {
+		await h.close();
+	}
+});
+
+test("phone writes: a refused folder list read gives 502, and nothing is written", async () => {
+	const seen: Seen[] = [];
+	const h = await harness({
+		upstream: (req, res) => {
+			seen.push({ method: req.method!, url: req.url!, headers: req.headers, body: "" });
+			req.resume();
+			res.writeHead(500, { "Content-Type": "application/json" });
+			res.end(JSON.stringify({ error: "boom" }));
+		},
+	});
+	try {
+		const token = await pairedToken(h);
+		const res = await folderWrite(h, token, JSON.stringify({ action: "create-folder", name: "A", parentId: null }));
+		assert.equal(res.status, 502);
+		await res.text();
+		assert.equal(seen.filter((r) => r.method === "POST").length, 0);
 	} finally {
 		await h.close();
 	}

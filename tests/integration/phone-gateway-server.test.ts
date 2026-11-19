@@ -359,6 +359,27 @@ describe("phone gateway in front of the real server", { concurrency: false }, ()
 		assert.ok(fake.requests.some((r) => r.role === "practitioner"));
 	});
 
+	it("changes folders through the checked write; a source delete stays refused", async () => {
+		const created = await phoneJSON("/api/graph/sources", "POST", { action: "create-folder", name: "Oceans", parentId: null });
+		assert.equal(created.status, 200, JSON.stringify(created.body));
+		const folderId = created.body.createdFolderId as string;
+		assert.ok(folderId);
+		const moved = await phoneJSON("/api/graph/sources", "POST", { action: "move", kind: "source", id: chatId, parentId: folderId });
+		assert.equal(moved.status, 200, JSON.stringify(moved.body));
+		assert.equal(moved.body.organization.placements[chatId].folderId, folderId);
+		const renamed = await phoneJSON("/api/graph/sources", "POST", { action: "rename-folder", id: folderId, name: "Seas" });
+		assert.equal(renamed.body.organization.folders.find((f: any) => f.id === folderId).name, "Seas");
+		const notEmpty = await phoneJSON("/api/graph/sources", "POST", { action: "delete-folder", id: folderId });
+		assert.equal(notEmpty.status, 400, "the server refuses to delete a folder that is not empty");
+		assert.equal((await phoneJSON("/api/graph/sources", "POST", { action: "move", kind: "source", id: chatId, parentId: null })).status, 200);
+		const deleted = await phoneJSON("/api/graph/sources", "POST", { action: "delete-folder", id: folderId });
+		assert.equal(deleted.status, 200);
+		assert.equal(deleted.body.organization.folders.some((f: any) => f.id === folderId), false);
+		assert.equal((await phoneJSON("/api/graph/sources", "POST", { action: "create-folder", name: "x".repeat(201), parentId: null })).status, 400);
+		assert.equal((await phoneJSON("/api/graph/sources", "DELETE", { ids: [chatId] })).status, 403);
+		assert.ok((await phoneJSON(`/api/chats/${chatId}`)).status === 200, "the session is still there");
+	});
+
 	it("the phone sends nothing to a server with a wrong certificate", async () => {
 		// An impostor at a saved address (another network, same IP).
 		const seen: string[] = [];
