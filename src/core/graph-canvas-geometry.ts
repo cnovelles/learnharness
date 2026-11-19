@@ -140,3 +140,480 @@ export function pickNearest<T extends { id: string; x: number; y: number }>(
 	}
 	return best;
 }
+
+// ─── Shared draw constants (moved from components/graph-canvas.ts) ──────────
+//
+// The desktop renderer and the phone canvas draw with these numbers, so a
+// change here changes both looks. Sizes are WORLD units unless they say
+// "screen px".
+
+/** The reference label size the wrap-width ratio is taken against. */
+export const LABEL_SIZE = 12;
+export const LABEL_WEIGHT = "500";
+/** The node label wrap width at the reference label size, world units. */
+export const LABEL_MAX_WIDTH = 170;
+/** World units between the node edge and the first label line. */
+export const LABEL_GAP = 2.9;
+export const LABEL_LINE_HEIGHT = 1.3;
+
+/** Region (cluster) labels wrap at a screen-fixed width, capped at a line
+ *  count with an ellipsis on the last line (owner, 2026-09-23). */
+export const REGION_LABEL_MAX_WIDTH = 220; // screen px
+export const REGION_LABEL_MAX_LINES = 3;
+export const REGION_LABEL_LINE_HEIGHT = 1.3;
+
+/** Halo outer radius = node radius x this. */
+export const GLOW_SCALE = 1.7;
+/** Halo opacity at the disc edge, fading outward. */
+export const GLOW_ALPHA = 0.3;
+/** Extra pickable radius (screen px) beyond the disc. */
+export const PICKING_PAD = 10;
+/** Click vs drag threshold: pointer travel under this many px is a click. */
+export const CLICK_SLOP = 4;
+/** The padding (screen px) of the fit-to-view camera. */
+export const FIT_PADDING = 40;
+/** The camera scale limits (the desktop d3-zoom scaleExtent). */
+export const ZOOM_EXTENT: readonly [number, number] = [0.02, 40];
+
+/** Stable hue per cluster id (content-hash): the region keeps its color
+ *  across reshuffles because the id only changes when the members do. */
+export function clusterHue(id: string): number {
+	let h = 0;
+	for (const ch of id) h = (h * 31 + ch.charCodeAt(0)) % 360;
+	return h;
+}
+
+// ─── Labels ─────────────────────────────────────────────────────────────────
+
+/** The node label wrap width (world units) for a label size. */
+export function labelWrapWidth(labelSize: number): number {
+	return LABEL_MAX_WIDTH * (labelSize / LABEL_SIZE);
+}
+
+/** Word-wrap for node labels. Never truncates: overlong single words are
+ *  hard-broken by character so no line ever exceeds maxWidth. `measure`
+ *  is the canvas text measure (or a fake in tests). */
+export function wrapLabel(text: string, maxWidth: number, measure: (s: string) => number): string[] {
+	const lines: string[] = [];
+	for (const word of text.split(/\s+/).filter(Boolean)) {
+		const last = lines.length > 0 ? lines[lines.length - 1]! : null;
+		if (last !== null) {
+			const joined = `${last} ${word}`;
+			if (measure(joined) <= maxWidth) {
+				lines[lines.length - 1] = joined;
+				continue;
+			}
+		}
+		let chunk = "";
+		for (const char of graphemes(word)) {
+			if (chunk && measure(`${chunk}${char}`) > maxWidth) {
+				lines.push(chunk);
+				chunk = char;
+			} else {
+				chunk += char;
+			}
+		}
+		if (chunk) lines.push(chunk);
+	}
+	return lines;
+}
+
+/** Wrap one region label: word-wise first (session names), then
+ *  char-wise for words alone wider than the max (long file paths — the
+ *  node-label discipline), capped at maxLines. Overflow folds into the
+ *  last line, ellipsized to fit. measure is the canvas measureText (or a
+ *  fake in tests) — pure otherwise. */
+export function wrapRegionLabel(
+	text: string,
+	maxWidth: number,
+	maxLines: number,
+	measure: (s: string) => number,
+): string[] {
+	if (maxLines < 1) return [text];
+	if (measure(text) <= maxWidth) return [text];
+	const lines: string[] = [];
+	const pending: string[] = text.split(/\s+/).filter(Boolean);
+	// Fill up to maxLines-1 lines; the remainder becomes the last line.
+	while (pending.length > 0 && lines.length < maxLines - 1) {
+		let line = "";
+		while (pending.length > 0) {
+			let word = pending[0]!;
+			const candidate = line ? `${line} ${word}` : word;
+			if (measure(candidate) <= maxWidth) {
+				line = candidate;
+				pending.shift();
+				continue;
+			}
+			if (!line) {
+				// The word alone overflows: char-split it, the remainder stays
+				// pending for the next line (paths have no spaces to help).
+				const chars = graphemes(word);
+				let chunk = "";
+				let used = 0;
+				while (used < chars.length && measure(chunk + chars[used]) <= maxWidth) chunk += chars[used++];
+				word = chars.slice(used).join("");
+				if (chunk) {
+					lines.push(chunk);
+					pending[0] = word;
+				} else {
+					// Degenerate: one char exceeds the width — keep it whole so
+					// the label can never vanish entirely.
+					lines.push(word);
+					pending.shift();
+				}
+				line = "";
+			}
+			break;
+		}
+		if (line) lines.push(line);
+		if (!line && lines.length > 0 && pending.length > 0) continue;
+		if (!line && lines.length === 0) break;
+	}
+	// The remainder rides as the last line: plain if it fits, ellipsized
+	// down to the width if not.
+	const rest = pending.join(" ");
+	if (!rest) return lines;
+	if (measure(rest) <= maxWidth) {
+		lines.push(rest);
+		return lines;
+	}
+	const tail = graphemes(rest);
+	while (tail.length > 1 && measure(`${tail.join("")}…`) > maxWidth) tail.pop();
+	lines.push(`${tail.join("")}…`);
+	return lines;
+}
+
+// Upstream v0.7.0: split labels only between graphemes. The phone's Hermes
+// may have no Intl.Segmenter; then code points are the fallback.
+const graphemeSegmenter =
+	typeof Intl !== "undefined" && typeof Intl.Segmenter === "function"
+		? new Intl.Segmenter(undefined, { granularity: "grapheme" })
+		: null;
+/** The user-perceived characters of `s` (emoji, flags and accented letters
+ *  stay whole) — the only safe units to split a label between. */
+export function graphemes(s: string): string[] {
+	return graphemeSegmenter ? Array.from(graphemeSegmenter.segment(s), (g) => g.segment) : Array.from(s);
+}
+
+// ─── Edges ──────────────────────────────────────────────────────────────────
+
+/** All edge glyphs of one geometry build, as flat number lists (cheap to
+ *  turn into one Path2D or one Skia path). */
+export interface EdgeGlyphs {
+	/** Shaft segments: x1, y1, x2, y2 for each edge. */
+	shafts: number[];
+	/** Head triangles: tip x, y, left x, y, right x, y for each head. */
+	heads: number[];
+}
+
+/**
+ * The shafts and arrowheads (rendering arc, owner 2026-09-30): all arrows
+ * are PLAIN single shafts. Lines INTO an implication node are HEADLESS and
+ * run to the imp node's CENTER (co-premise lines converge to a point); the
+ * line OUT of it starts at the center and its arrowhead lands on the
+ * conclusion's disc edge. Edges with a hidden or unknown end are skipped.
+ */
+export function edgeGlyphs(
+	edges: ReadonlyArray<{ from: string; to: string }>,
+	nodeById: ReadonlyMap<string, Pt>,
+	isVisible: (id: string) => boolean,
+	nodeR: number,
+	arrowLength: number,
+): EdgeGlyphs {
+	const shafts: number[] = [];
+	const heads: number[] = [];
+	for (const e of edges) {
+		if (!isVisible(e.from) || !isVisible(e.to)) continue;
+		const a = nodeById.get(e.from);
+		const b = nodeById.get(e.to);
+		if (!a || !b) continue;
+		const intoImp = isImpNodeId(e.to);
+		const outOfImp = isImpNodeId(e.from);
+		const g = arrowGeometry(a, b, outOfImp ? 0 : nodeR, intoImp ? 0 : nodeR, arrowLength);
+		if (!g) continue;
+		if (intoImp) {
+			// toRadius 0 put the tip AT the imp node's center: the headless
+			// shaft terminates there (no head triangle).
+			shafts.push(g.shaftFrom.x, g.shaftFrom.y, g.tip.x, g.tip.y);
+		} else {
+			shafts.push(g.shaftFrom.x, g.shaftFrom.y, g.shaftTo.x, g.shaftTo.y);
+			heads.push(g.tip.x, g.tip.y, g.left.x, g.left.y, g.right.x, g.right.y);
+		}
+	}
+	return { shafts, heads };
+}
+
+// ─── Regions ────────────────────────────────────────────────────────────────
+
+/** One region label anchor: the centroid of the visible members. */
+export interface RegionAnchor {
+	id: string;
+	label: string | null;
+	cx: number;
+	cy: number;
+	hue: number;
+}
+
+/** The region label anchors, in cluster order. A cluster with no visible
+ *  member has no anchor. */
+export function regionAnchors(
+	clusters: ReadonlyArray<{ id: string; label: string | null; members: ReadonlyArray<string> }>,
+	nodeById: ReadonlyMap<string, Pt>,
+	isVisible: (id: string) => boolean,
+): RegionAnchor[] {
+	const anchors: RegionAnchor[] = [];
+	for (const cluster of clusters) {
+		let members = 0;
+		let sumX = 0;
+		let sumY = 0;
+		for (const id of cluster.members) {
+			if (!isVisible(id)) continue;
+			const n = nodeById.get(id);
+			if (!n) continue;
+			members++;
+			sumX += n.x;
+			sumY += n.y;
+		}
+		if (members > 0)
+			anchors.push({
+				id: cluster.id,
+				label: cluster.label || null,
+				cx: sumX / members,
+				cy: sumY / members,
+				hue: clusterHue(cluster.id),
+			});
+	}
+	return anchors;
+}
+
+/** One cluster's paint in the region bitmap, in bitmap px. */
+export interface RegionLayer {
+	hue: number;
+	/** Intra-cluster edge strokes (round caps): x1, y1, x2, y2 each. */
+	segments: number[];
+	/** Discs for members that no stroke reached: x, y each. */
+	discs: number[];
+}
+
+/** The region splat bitmap: what to paint, and where to draw it. */
+export interface RegionSplat {
+	/** The world rect that the bitmap covers. */
+	rect: { minX: number; minY: number; w: number; h: number };
+	/** World units per bitmap px. */
+	cell: number;
+	/** The bitmap size, px. */
+	width: number;
+	height: number;
+	/** The stroke width and the disc radius, bitmap px. */
+	lineWidth: number;
+	discR: number;
+	/** The box-blur radius, bitmap px (3 rounds, then x edgeAlpha). */
+	blurPx: number;
+	layers: RegionLayer[];
+}
+
+/**
+ * The region splat plan (the density-field technique): every intra-cluster
+ * edge paints a round-cap stroke (dilation) and every member that no
+ * stroke reached paints one disc of the same radius, at full opacity. The
+ * caller blurs the bitmap and scales its alpha by `edgeAlpha` once. Null
+ * when no cluster has a visible member. Pure: the desktop paints it on a
+ * Canvas 2D, the phone on a Skia surface.
+ */
+export function regionSplat(
+	clusters: ReadonlyArray<{ id: string; members: ReadonlyArray<string> }>,
+	edges: ReadonlyArray<{ from: string; to: string }>,
+	nodeById: ReadonlyMap<string, Pt>,
+	isVisible: (id: string) => boolean,
+	tuning: { dilation: number; blur: number; bitmap: number },
+): RegionSplat | null {
+	// World rect over VISIBLE cluster members.
+	let minX = Infinity;
+	let minY = Infinity;
+	let maxX = -Infinity;
+	let maxY = -Infinity;
+	for (const c of clusters) {
+		for (const id of c.members) {
+			if (!isVisible(id)) continue;
+			const n = nodeById.get(id);
+			if (!n) continue;
+			if (n.x < minX) minX = n.x;
+			if (n.x > maxX) maxX = n.x;
+			if (n.y < minY) minY = n.y;
+			if (n.y > maxY) maxY = n.y;
+		}
+	}
+	if (minX > maxX) return null;
+
+	const clusterOf = new Map<string, number>();
+	clusters.forEach((c, i) => {
+		for (const id of c.members) clusterOf.set(id, i);
+	});
+
+	// Bitmap sizing: the longest world span maps to `bitmap` px. The rect
+	// is padded by the stroke half-width plus the blur reach so nothing
+	// clips. Cell floor: a single visible node (span 0) must not zero the
+	// cell (the dims would blow to Infinity).
+	const dilationW = tuning.dilation;
+	const blurW = tuning.blur;
+	const padWorld = dilationW + blurW * 2;
+	const spanNow = Math.max(maxX - minX, maxY - minY);
+	const cell = Math.max(spanNow, padWorld * 2) / tuning.bitmap;
+	minX -= padWorld;
+	minY -= padWorld;
+	maxX += padWorld;
+	maxY += padWorld;
+	const spanX = maxX - minX;
+	const spanY = maxY - minY;
+
+	const layers: RegionLayer[] = [];
+	clusters.forEach((cluster, ci) => {
+		const segments: number[] = [];
+		const touched = new Set<string>();
+		for (const e of edges) {
+			if (clusterOf.get(e.from) !== ci) continue;
+			if (clusterOf.get(e.to) !== ci) continue;
+			// Search filter: stroke only fully-visible edges (a hidden end
+			// cut hue streaks across other regions, 2026-09-14).
+			if (!isVisible(e.from) || !isVisible(e.to)) continue;
+			const a = nodeById.get(e.from);
+			const b = nodeById.get(e.to);
+			if (!a || !b) continue;
+			segments.push((a.x - minX) / cell, (a.y - minY) / cell, (b.x - minX) / cell, (b.y - minY) / cell);
+			touched.add(e.from);
+			touched.add(e.to);
+		}
+		const discs: number[] = [];
+		for (const id of cluster.members) {
+			if (touched.has(id) || !isVisible(id)) continue;
+			const n = nodeById.get(id);
+			if (!n) continue;
+			discs.push((n.x - minX) / cell, (n.y - minY) / cell);
+		}
+		layers.push({ hue: clusterHue(cluster.id), segments, discs });
+	});
+
+	return {
+		rect: { minX, minY, w: spanX, h: spanY },
+		cell,
+		width: Math.max(1, Math.ceil(spanX / cell)),
+		height: Math.max(1, Math.ceil(spanY / cell)),
+		lineWidth: (dilationW * 2) / cell,
+		discR: dilationW / cell,
+		blurPx: tuning.blur > 0 ? Math.max(1, Math.round(blurW / cell)) : 0,
+		layers,
+	};
+}
+
+/** One horizontal+vertical box-blur round over PREMULTIPLIED RGBA
+ *  (Float32, stride 4, length w*h*4). Premultiplying first is what keeps
+ *  the blur halo-free: blurring non-premultiplied RGB over varying alpha
+ *  bleeds solid color into transparent space. Pure: DOM-free, tested. */
+export function boxBlurRound(
+	src: Float32Array,
+	tmp: Float32Array,
+	dst: Float32Array,
+	w: number,
+	h: number,
+	radius: number,
+): void {
+	if (radius <= 0) {
+		dst.set(src);
+		return;
+	}
+	const div = radius * 2 + 1;
+	// Horizontal: src → tmp (clamped window, running sum).
+	for (let y = 0; y < h; y++) {
+		const row = y * w * 4;
+		let sum0 = 0, sum1 = 0, sum2 = 0, sum3 = 0;
+		for (let x = -radius; x <= radius; x++) {
+			const i = row + Math.min(Math.max(x, 0), w - 1) * 4;
+			sum0 += src[i]!;
+			sum1 += src[i + 1]!;
+			sum2 += src[i + 2]!;
+			sum3 += src[i + 3]!;
+		}
+		for (let x = 0; x < w; x++) {
+			const o = row + x * 4;
+			tmp[o] = sum0 / div;
+			tmp[o + 1] = sum1 / div;
+			tmp[o + 2] = sum2 / div;
+			tmp[o + 3] = sum3 / div;
+			const addI = row + Math.min(x + radius + 1, w - 1) * 4;
+			const subI = row + Math.max(x - radius, 0) * 4;
+			sum0 += src[addI]! - src[subI]!;
+			sum1 += src[addI + 1]! - src[subI + 1]!;
+			sum2 += src[addI + 2]! - src[subI + 2]!;
+			sum3 += src[addI + 3]! - src[subI + 3]!;
+		}
+	}
+	// Vertical: tmp → dst.
+	for (let x = 0; x < w; x++) {
+		const col = x * 4;
+		let sum0 = 0, sum1 = 0, sum2 = 0, sum3 = 0;
+		for (let y = -radius; y <= radius; y++) {
+			const i = col + Math.min(Math.max(y, 0), h - 1) * w * 4;
+			sum0 += tmp[i]!;
+			sum1 += tmp[i + 1]!;
+			sum2 += tmp[i + 2]!;
+			sum3 += tmp[i + 3]!;
+		}
+		for (let y = 0; y < h; y++) {
+			const o = col + y * w * 4;
+			dst[o] = sum0 / div;
+			dst[o + 1] = sum1 / div;
+			dst[o + 2] = sum2 / div;
+			dst[o + 3] = sum3 / div;
+			const addI = col + Math.min(y + radius + 1, h - 1) * w * 4;
+			const subI = col + Math.max(y - radius, 0) * w * 4;
+			sum0 += tmp[addI]! - tmp[subI]!;
+			sum1 += tmp[addI + 1]! - tmp[subI + 1]!;
+			sum2 += tmp[addI + 2]! - tmp[subI + 2]!;
+			sum3 += tmp[addI + 3]! - tmp[subI + 3]!;
+		}
+	}
+}
+
+/**
+ * The region blur and alpha on RGBA pixels (in place): premultiply, three
+ * box-blur rounds, unpremultiply, then scale the alpha by `edgeAlpha` once
+ * (the order is a user decision, 2026-09-14). The result: a constant
+ * interior alpha where covered, tapering only across the blur edges.
+ */
+export function blurRegionPixels(
+	data: Uint8ClampedArray | Uint8Array,
+	w: number,
+	h: number,
+	blurPx: number,
+	edgeAlpha: number,
+): void {
+	const n = w * h * 4;
+	const a = new Float32Array(n);
+	for (let i = 0; i < n; i += 4) {
+		const alpha = data[i + 3]! / 255;
+		a[i] = data[i]! * alpha;
+		a[i + 1] = data[i + 1]! * alpha;
+		a[i + 2] = data[i + 2]! * alpha;
+		a[i + 3] = data[i + 3]!;
+	}
+	const b = new Float32Array(n);
+	const tmp = new Float32Array(n); // scratch inside each round only
+	boxBlurRound(a, tmp, b, w, h, blurPx); // a → b
+	boxBlurRound(b, tmp, a, w, h, blurPx); // b → a
+	boxBlurRound(a, tmp, b, w, h, blurPx); // a → b (result)
+	for (let i = 0; i < n; i += 4) {
+		const alpha = b[i + 3]!;
+		if (alpha <= 0) {
+			data[i] = 0;
+			data[i + 1] = 0;
+			data[i + 2] = 0;
+			data[i + 3] = 0;
+		} else {
+			// Un-premultiply: pm = c * a/255, so c = pm / a * 255.
+			data[i] = Math.round((b[i]! / alpha) * 255);
+			data[i + 1] = Math.round((b[i + 1]! / alpha) * 255);
+			data[i + 2] = Math.round((b[i + 2]! / alpha) * 255);
+			data[i + 3] = Math.round(alpha * edgeAlpha);
+		}
+	}
+}
