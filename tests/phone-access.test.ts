@@ -160,7 +160,7 @@ test("addresses list Tailscale first and skip loopback and IPv6", () => {
 
 interface Seen { method: string; url: string; headers: http.IncomingHttpHeaders; body: string }
 
-async function harness(options: { now?: () => number; upstream?: http.RequestListener; onPairingCancelled?: (reason: string) => void; networkInterfaces?: () => Record<string, any[]> } = {}) {
+async function harness(options: { now?: () => number; upstream?: http.RequestListener; onPairingCancelled?: (reason: string) => void; networkInterfaces?: () => Record<string, any[]>; writeBodyTimeoutMs?: number } = {}) {
 	const seen: Seen[] = [];
 	const upstream = http.createServer(options.upstream ?? ((req, res) => {
 		const chunks: Buffer[] = [];
@@ -178,7 +178,7 @@ async function harness(options: { now?: () => number; upstream?: http.RequestLis
 	const paired: Array<{ id: string; name: string }> = [];
 	const tlsDir = path.join(path.dirname(storeFile), "tls");
 	const logs: string[] = [];
-	const gateway = createPhoneGateway({ store, tlsDir, log: (line: string) => logs.push(line), target: () => ({ url: upstreamURL, secret: SECRET }), info: { name: "test-mac", version: "0.0.0" }, now: options.now, onPaired: (d: { id: string; name: string }) => paired.push(d), onPairingCancelled: options.onPairingCancelled, networkInterfaces: options.networkInterfaces });
+	const gateway = createPhoneGateway({ store, tlsDir, log: (line: string) => logs.push(line), target: () => ({ url: upstreamURL, secret: SECRET }), info: { name: "test-mac", version: "0.0.0" }, now: options.now, onPaired: (d: { id: string; name: string }) => paired.push(d), onPairingCancelled: options.onPairingCancelled, networkInterfaces: options.networkInterfaces, writeBodyTimeoutMs: options.writeBodyTimeoutMs });
 	const addr = await gateway.start({ host: "127.0.0.1", port: 0 });
 	const base = `https://127.0.0.1:${addr.port}`;
 	const fetch = pinnedFetch(gateway.pin());
@@ -738,6 +738,122 @@ test("phone writes: a refused folder list read gives 502, and nothing is written
 		assert.equal(res.status, 502);
 		await res.text();
 		assert.equal(seen.filter((r) => r.method === "POST").length, 0);
+	} finally {
+		await h.close();
+	}
+});
+
+test("phone writes: two new folders at the same time cannot both pass the limit", async () => {
+	const seen: Seen[] = [];
+	let folders = MAX_FOLDERS - 1;
+	const h = await harness({
+		upstream: (req, res) => {
+			const chunks: Buffer[] = [];
+			req.on("data", (c) => chunks.push(c));
+			req.on("end", () => {
+				seen.push({ method: req.method!, url: req.url!, headers: req.headers, body: Buffer.concat(chunks).toString() });
+				res.writeHead(200, { "Content-Type": "application/json" });
+				if (req.method === "GET") {
+					const list = Array.from({ length: folders }, (_, i) => ({ id: `folder_${i}`, name: `F${i}`, parentId: null, createdAt: "x" }));
+					// A slow read: without the queue, both writes would see 499.
+					setTimeout(() => res.end(JSON.stringify({ organization: { version: 1, folders: list, placements: {} }, sources: [] })), 50);
+				} else {
+					folders += 1;
+					res.end(JSON.stringify({ ok: true }));
+				}
+			});
+		},
+	});
+	try {
+		const token = await pairedToken(h);
+		const send = () => folderWrite(h, token, JSON.stringify({ action: "create-folder", name: "New", parentId: null })).then(async (r) => { await r.text(); return r.status; });
+		const statuses = (await Promise.all([send(), send()])).sort();
+		assert.deepEqual(statuses, [200, 409]);
+		assert.equal(seen.filter((r) => r.method === "POST").length, 1);
+		assert.equal(folders, MAX_FOLDERS);
+	} finally {
+		await h.close();
+	}
+});
+
+test("phone writes: a phone removed while its write waits sends nothing", async () => {
+	const seen: Seen[] = [];
+	let release: () => void = () => {};
+	const listRead = new Promise<void>((r) => { release = r; });
+	let gotRead: () => void = () => {};
+	const readStarted = new Promise<void>((r) => { gotRead = r; });
+	const h = await harness({
+		upstream: (req, res) => {
+			req.resume();
+			req.on("end", async () => {
+				seen.push({ method: req.method!, url: req.url!, headers: req.headers, body: "" });
+				res.writeHead(200, { "Content-Type": "application/json" });
+				if (req.method === "GET") {
+					gotRead();
+					await listRead;
+					res.end(JSON.stringify({ organization: { version: 1, folders: [], placements: {} }, sources: [] }));
+				} else res.end(JSON.stringify({ ok: true }));
+			});
+		},
+	});
+	try {
+		const token = await pairedToken(h);
+		const deviceId = h.store.read().devices[0].id;
+		const pending = folderWrite(h, token, JSON.stringify({ action: "create-folder", name: "New", parentId: null }));
+		await readStarted;
+		h.gateway.revoke(deviceId);
+		release();
+		const res = await pending.catch(() => null);
+		if (res) {
+			assert.equal(res.status, 401);
+			await res.text();
+		}
+		assert.equal(seen.filter((r) => r.method === "POST").length, 0);
+	} finally {
+		await h.close();
+	}
+});
+
+test("phone writes: a folder list with no folders array refuses the new folder", async () => {
+	const seen: Seen[] = [];
+	const h = await harness({
+		upstream: (req, res) => {
+			req.resume();
+			req.on("end", () => {
+				seen.push({ method: req.method!, url: req.url!, headers: req.headers, body: "" });
+				res.writeHead(200, { "Content-Type": "application/json" });
+				res.end(JSON.stringify({ organization: {}, sources: [] }));
+			});
+		},
+	});
+	try {
+		const token = await pairedToken(h);
+		const res = await folderWrite(h, token, JSON.stringify({ action: "create-folder", name: "New", parentId: null }));
+		assert.equal(res.status, 502);
+		await res.text();
+		assert.equal(seen.filter((r) => r.method === "POST").length, 0);
+	} finally {
+		await h.close();
+	}
+});
+
+test("phone writes: a body that does not end in time closes the request; nothing reaches the server", async () => {
+	const seen: Seen[] = [];
+	const h = await harness({ upstream: folderUpstream(0, seen), writeBodyTimeoutMs: 200 });
+	try {
+		const token = await pairedToken(h);
+		const outcome = await new Promise<string>((resolve) => {
+			const req = require("node:https").request(`${h.base}/api/graph/sources`, {
+				method: "POST",
+				rejectUnauthorized: false,
+				headers: { authorization: `Bearer ${token}`, "content-type": "application/json", "content-length": "100" },
+			}, (r: http.IncomingMessage) => { r.resume(); resolve(`status ${r.statusCode}`); });
+			req.on("error", () => resolve("closed"));
+			req.write('{"action":"create-folder"');
+			// The rest of the body never comes.
+		});
+		assert.equal(outcome, "closed");
+		assert.equal(seen.length, 0);
 	} finally {
 		await h.close();
 	}
