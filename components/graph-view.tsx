@@ -75,6 +75,11 @@ import { FileTextIcon, ListTreeIcon, Loader2Icon, SearchIcon, SettingsIcon, Wayp
 import { graphFolderIds, graphFolderVisibleIds, incrementalLayout, propositionSessionHref, type GraphCostSummary, type GraphNode, type GraphSnapshot } from "@/src/core";
 import { planCostLabel } from "@/components/usage-format";
 import { CLUSTER_LIGHTNESS, GraphCanvasRenderer, type GraphRenderSettings } from "./graph-canvas.ts";
+import { displayCostTotals, isNodeVisible, seedMissingNodePositions } from "@/src/core";
+
+// The pure view helpers live in src/core (the phone shares them); the old
+// names stay importable from here.
+export { displayCostTotals, isNodeVisible, seedMissingNodePositions };
 import { useAppearance } from "@/components/settings/appearance";
 import { usePopoverDismiss } from "@/components/popover-dismiss";
 import { INTERACTION_LAYER_Z_BASE } from "@/components/host-dialog";
@@ -134,17 +139,6 @@ const CAMERA_STORAGE_KEY = "lh.graph.camera.v1";
 
 type RenderSettings = GraphRenderSettings;
 
-/**
- * Pure filter predicate for the search panel: a node is visible when the
- * query is empty or matches its name or statement (case-insensitive).
- * Exported for tests; the visibility feed just consumes its verdict.
- */
-export function isNodeVisible(node: Pick<GraphNode, "name" | "statement">, query: string): boolean {
-	const q = query.trim().toLowerCase();
-	if (!q) return true;
-	return node.name.toLowerCase().includes(q) || node.statement.toLowerCase().includes(q);
-}
-
 /** Search alone retains its existing behavior. With an active folder filter,
  * a junction can only draw if every endpoint survives the combined view. */
 export function graphVisibleIds(snapshot: Pick<GraphSnapshot, "nodes" | "impLinks">, query: string, folderVisibleIds: ReadonlySet<string> | null): Set<string> {
@@ -173,49 +167,6 @@ export function graphVisibleIds(snapshot: Pick<GraphSnapshot, "nodes" | "impLink
  *  the server derives the same join on its next read. */
 export function renameSessionsPatch(snapshot: Pick<GraphSnapshot, "sessions">, id: string, title: string): void {
 	snapshot.sessions[id] = title;
-}
-
-/** Seed positions for nodes the ledger doesn't know yet (hygiene,
- *  2026-09-23 fix wave): they used to fall through to a ?? 0 and dump
- *  at the origin. Place them on a deterministic ring around the known
- *  positions' centroid — angle hashed from the id (FNV-1a), golden-angle
- *  spiral offset so even hash collisions spread. Stable across
- *  remounts, far enough off the mass to see, and they relax with the
- *  pack on the next drag. In-place on the provided map; pure otherwise. */
-export function seedMissingNodePositions(
-	nodes: readonly { id: string }[],
-	positions: Map<string, { x: number; y: number }>,
-): Map<string, { x: number; y: number }> {
-	if (positions.size === 0 || nodes.every((n) => positions.has(n.id))) return positions;
-	let minX = Infinity;
-	let minY = Infinity;
-	let maxX = -Infinity;
-	let maxY = -Infinity;
-	for (const p of positions.values()) {
-		if (p.x < minX) minX = p.x;
-		if (p.y < minY) minY = p.y;
-		if (p.x > maxX) maxX = p.x;
-		if (p.y > maxY) maxY = p.y;
-	}
-	const cx = (minX + maxX) / 2;
-	const cy = (minY + maxY) / 2;
-	const radius = Math.max(maxX - minX, maxY - minY, 40) * 0.7 + 20;
-	const missing = nodes.filter((n) => !positions.has(n.id));
-	missing.forEach((n, i) => {
-		// FNV-1a hash → [0,1) → angle; the golden-angle spiral offset
-		// both spreads collisions and staggers long paths deterministically.
-		let h = 0x811c9dc5;
-		for (let c = 0; c < n.id.length; c++) {
-			h ^= n.id.charCodeAt(c);
-			h = (h * 0x01000193) >>> 0;
-		}
-		const angle = ((h / 0xffffffff) * 2 * Math.PI + i * 2.39996323) % (2 * Math.PI);
-		positions.set(n.id, {
-			x: cx + Math.cos(angle) * radius,
-			y: cy + Math.sin(angle) * radius,
-		});
-	});
-	return positions;
 }
 
 // ---- Color helpers (canvas wants hex, not oklch) ---------------------------
@@ -290,27 +241,6 @@ function graphUsageLabel(costs: Pick<GraphCostSummary, "stages">): string {
 	const priced = stages.some((stage) => stage.runs - stage.unpricedRuns - (stage.subscriptionRuns ?? 0) > 0);
 	const dollars = displayCostTotals(costs).totalDollars;
 	return planCostLabel(priced ? dollars : null, providers, (value) => `$${value.toFixed(2)}`);
-}
-
-/**
- * The cost figures the UI DISPLAYS (owner refinement round, 2026-09-24):
- * extraction + audit only. Cluster naming is dead — labels are session
- * titles / file names — so the core's naming fold (and its historical
- * spend) is deliberately not shown anywhere: the pill and the panel must
- * agree, and both read THIS, never GraphCostSummary.totalDollars.
- * (The core fold's naming stage was then culled outright — 2026-09-24 —
- * so the recent-runs list carries extraction runs only.)
- */
-export function displayCostTotals(costs: Pick<GraphCostSummary, "stages">): {
-	totalDollars: number;
-	unpricedRuns: number;
-} {
-	// The two live stages (the spine came and went on one day,
-	// 2026-09-30 — digest-aware extraction replaced it).
-	return {
-		totalDollars: costs.stages.extraction.dollars + costs.stages.audit.dollars,
-		unpricedRuns: costs.stages.extraction.unpricedRuns + costs.stages.audit.unpricedRuns,
-	};
 }
 
 /**
