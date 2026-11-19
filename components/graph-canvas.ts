@@ -54,7 +54,7 @@
 import { select } from "d3-selection";
 import { zoom, zoomIdentity, type ZoomBehavior, type ZoomTransform } from "d3-zoom";
 import type { Simulation, SimulationLinkDatum } from "d3-force";
-import { clusterHue, type Pt } from "./cluster-geometry.ts";
+import type { Pt } from "./cluster-geometry.ts";
 import type { RenderedMode } from "@/src/core";
 import {
 	CHARGE_STRENGTH,
@@ -75,13 +75,33 @@ import {
 } from "@/src/core";
 
 import {
+	CLICK_SLOP,
 	CLUSTER_LIGHTNESS,
+	FIT_PADDING,
+	GLOW_ALPHA,
+	GLOW_SCALE,
+	LABEL_GAP,
+	LABEL_LINE_HEIGHT,
+	LABEL_WEIGHT,
 	LABELS_FADE_RATIO,
+	PICKING_PAD,
+	REGION_LABEL_LINE_HEIGHT,
+	REGION_LABEL_MAX_LINES,
+	REGION_LABEL_MAX_WIDTH,
+	ZOOM_EXTENT,
 	arrowGeometry,
+	blurRegionPixels,
+	boxBlurRound,
+	edgeGlyphs,
 	fitTransform,
 	isImpNodeId,
 	labelAlpha,
+	labelWrapWidth,
 	pickNearest,
+	regionAnchors,
+	regionSplat,
+	wrapLabel,
+	wrapRegionLabel,
 	zoomRatioOf,
 	type ArrowGeom,
 	type ClusterLightness,
@@ -94,10 +114,12 @@ export {
 	CLUSTER_LIGHTNESS,
 	LABELS_FADE_RATIO,
 	arrowGeometry,
+	boxBlurRound,
 	fitTransform,
 	isImpNodeId,
 	labelAlpha,
 	pickNearest,
+	wrapRegionLabel,
 	zoomRatioOf,
 	type ArrowGeom,
 	type ClusterLightness,
@@ -180,85 +202,6 @@ export interface RendererCallbacks {
 
 // ─── Constants (ported verbatim from the sigma view) ────────────────────────
 
-const LABEL_SIZE = 12; // the reference label size the wrap-width ratio is taken against
-const LABEL_WEIGHT = "500";
-
-/** Region (cluster) labels — wave 7's session names made the labels
- *  LONG: imported-file paths and renamed chat titles. They wrap at a
- *  screen-fixed width (the labels are viewer-relative — this px value
- *  is exact on screen at any zoom), capped at a line count with an
- *  ellipsis on the last line (owner, 2026-09-23: wrap, cap 2–3 lines,
- *  ellipsize — a bounded footprint that keeps most of the path
- *  visible). */
-const REGION_LABEL_MAX_WIDTH = 220; // screen px
-const REGION_LABEL_MAX_LINES = 3;
-const REGION_LABEL_LINE_HEIGHT = 1.3;
-
-/** Wrap one region label: word-wise first (session names), then
- *  char-wise for words alone wider than the max (long file paths — the
- *  node-label discipline), capped at maxLines. Overflow folds into the
- *  last line, ellipsized to fit. measure is the canvas measureText (or a
- *  fake in tests) — pure otherwise. */
-export function wrapRegionLabel(
-	text: string,
-	maxWidth: number,
-	maxLines: number,
-	measure: (s: string) => number,
-): string[] {
-	if (maxLines < 1) return [text];
-	if (measure(text) <= maxWidth) return [text];
-	const lines: string[] = [];
-	const pending: string[] = text.split(/\s+/).filter(Boolean);
-	// Fill up to maxLines-1 lines; the remainder becomes the last line.
-	while (pending.length > 0 && lines.length < maxLines - 1) {
-		let line = "";
-		while (pending.length > 0) {
-			let word = pending[0]!;
-			const candidate = line ? `${line} ${word}` : word;
-			if (measure(candidate) <= maxWidth) {
-				line = candidate;
-				pending.shift();
-				continue;
-			}
-			if (!line) {
-				// The word alone overflows: char-split it, the remainder stays
-				// pending for the next line (paths have no spaces to help).
-				let chunk = "";
-				while (word.length > 0 && measure(chunk + word[0]) <= maxWidth) {
-					chunk += word[0];
-					word = word.slice(1);
-				}
-				if (chunk) {
-					lines.push(chunk);
-					pending[0] = word;
-				} else {
-					// Degenerate: one char exceeds the width — keep it whole so
-					// the label can never vanish entirely.
-					lines.push(word);
-					pending.shift();
-				}
-				line = "";
-			}
-			break;
-		}
-		if (line) lines.push(line);
-		if (!line && lines.length > 0 && pending.length > 0) continue;
-		if (!line && lines.length === 0) break;
-	}
-	// The remainder rides as the last line: plain if it fits, ellipsized
-	// down to the width if not.
-	let rest = pending.join(" ");
-	if (!rest) return lines;
-	if (measure(rest) <= maxWidth) {
-		lines.push(rest);
-		return lines;
-	}
-	let tail = rest;
-	while (tail.length > 1 && measure(`${tail}…`) > maxWidth) tail = tail.slice(0, -1);
-	lines.push(`${tail}…`);
-	return lines;
-}
-
 /** Label-only cluster patch (rename-shuffle fix, 2026-09-23): apply a set
  *  of live label updates to the data-side cluster records AND the built
  *  region meta (re-wrapping the changed entries with the provided
@@ -296,21 +239,9 @@ export function applyClusterLabels(
 	}
 	return true;
 }
-const LABEL_MAX_WIDTH = 170; // wrap width at the reference label size, world units
-const LABEL_GAP = 2.9; // world units between node edge and first label line (the 2px-at-fit reference ÷ 0.69)
-const LABEL_LINE_HEIGHT = 1.3;
-
-const GLOW_SCALE = 1.7; // halo outer radius = node radius x this (proportional, like blurring a copy of the disc)
-const GLOW_ALPHA = 0.3; // halo opacity at the disc edge, fading outward
 const HOVER_FADE_MS = 180; // hover halo opacity fade length
 const ZOOM_EASE_MS = 45; // wheel-zoom glide: exponential-ease time constant (~250ms per notch)
 
-/** Extra pickable radius (px) beyond the disc — the whole halo is
- *  hit-testable (the old flicker fix, minus the picking shader). */
-const PICKING_PAD = 10;
-
-/** Click vs drag threshold: pointer travel under this many px is a click. */
-const CLICK_SLOP = 4;
 /** Live-sim tuning — see the class doc comment. */
 const LIVE_ALPHA_DECAY = 0.05; // snappier anneal than the settle's 0.0228
 const DRAG_ALPHA_TARGET = 0.3; // d3-drag's own reheat constant
@@ -330,75 +261,6 @@ const REGION_EVERY = 3; // live-sim frames: rebuild every Nth, blit the rest
 
 
 
-/** One horizontal+vertical box-blur round over PREMULTIPLIED RGBA
- *  (Float32, stride 4, length w*h*4). Premultiplying first is what keeps
- *  the blur halo-free: blurring non-premultiplied RGB over varying alpha
- *  bleeds solid color into transparent space. Pure: DOM-free, tested. */
-export function boxBlurRound(
-	src: Float32Array,
-	tmp: Float32Array,
-	dst: Float32Array,
-	w: number,
-	h: number,
-	radius: number,
-): void {
-	if (radius <= 0) {
-		dst.set(src);
-		return;
-	}
-	const div = radius * 2 + 1;
-	// Horizontal: src → tmp (clamped window, running sum).
-	for (let y = 0; y < h; y++) {
-		const row = y * w * 4;
-		let sum0 = 0, sum1 = 0, sum2 = 0, sum3 = 0;
-		for (let x = -radius; x <= radius; x++) {
-			const i = row + Math.min(Math.max(x, 0), w - 1) * 4;
-			sum0 += src[i]!;
-			sum1 += src[i + 1]!;
-			sum2 += src[i + 2]!;
-			sum3 += src[i + 3]!;
-		}
-		for (let x = 0; x < w; x++) {
-			const o = row + x * 4;
-			tmp[o] = sum0 / div;
-			tmp[o + 1] = sum1 / div;
-			tmp[o + 2] = sum2 / div;
-			tmp[o + 3] = sum3 / div;
-			const addI = row + Math.min(x + radius + 1, w - 1) * 4;
-			const subI = row + Math.max(x - radius, 0) * 4;
-			sum0 += src[addI]! - src[subI]!;
-			sum1 += src[addI + 1]! - src[subI + 1]!;
-			sum2 += src[addI + 2]! - src[subI + 2]!;
-			sum3 += src[addI + 3]! - src[subI + 3]!;
-		}
-	}
-	// Vertical: tmp → dst.
-	for (let x = 0; x < w; x++) {
-		const col = x * 4;
-		let sum0 = 0, sum1 = 0, sum2 = 0, sum3 = 0;
-		for (let y = -radius; y <= radius; y++) {
-			const i = col + Math.min(Math.max(y, 0), h - 1) * w * 4;
-			sum0 += tmp[i]!;
-			sum1 += tmp[i + 1]!;
-			sum2 += tmp[i + 2]!;
-			sum3 += tmp[i + 3]!;
-		}
-		for (let y = 0; y < h; y++) {
-			const o = col + y * w * 4;
-			dst[o] = sum0 / div;
-			dst[o + 1] = sum1 / div;
-			dst[o + 2] = sum2 / div;
-			dst[o + 3] = sum3 / div;
-			const addI = col + Math.min(y + radius + 1, h - 1) * w * 4;
-			const subI = col + Math.max(y - radius, 0) * w * 4;
-			sum0 += tmp[addI]! - tmp[subI]!;
-			sum1 += tmp[addI + 1]! - tmp[subI + 1]!;
-			sum2 += tmp[addI + 2]! - tmp[subI + 2]!;
-			sum3 += tmp[addI + 3]! - tmp[subI + 3]!;
-		}
-	}
-}
-
 /** Geometry constants are WORLD UNITS (the 2026-09-15 pivot): node/
  *  label/arrowhead sizes come from the settings directly — the same law
  *  as linkDistance — so the world scale is canonical and never depends on
@@ -417,33 +279,6 @@ function rgbaFromHex(hex: string, alpha: number): string {
 	const g = Number.parseInt(hex.slice(3, 5), 16);
 	const b = Number.parseInt(hex.slice(5, 7), 16);
 	return `rgba(${r}, ${g}, ${b}, ${alpha})`;
-}
-
-/** Word-wrap for canvas text. Never truncates: overlong single words are
- *  hard-broken by character so no line ever exceeds maxWidth. */
-function wrapLabel(context: CanvasRenderingContext2D, text: string, maxWidth: number): string[] {
-	const lines: string[] = [];
-	for (const word of text.split(/\s+/).filter(Boolean)) {
-		const last = lines.length > 0 ? lines[lines.length - 1]! : null;
-		if (last !== null) {
-			const joined = `${last} ${word}`;
-			if (context.measureText(joined).width <= maxWidth) {
-				lines[lines.length - 1] = joined;
-				continue;
-			}
-		}
-		let chunk = "";
-		for (const char of word) {
-			if (chunk && context.measureText(`${chunk}${char}`).width > maxWidth) {
-				lines.push(chunk);
-				chunk = char;
-			} else {
-				chunk += char;
-			}
-		}
-		if (chunk) lines.push(chunk);
-	}
-	return lines;
 }
 
 /** World-unit sizes for the label pass, derived once per geometry build. */
@@ -589,7 +424,7 @@ export class GraphCanvasRenderer {
 		// d3-zoom owns pan / wheel zoom-to-cursor / touch pinch; every
 		// transform change just marks dirty (draws happen in OUR loop).
 		this.zoomBehavior = zoom<HTMLCanvasElement, unknown>()
-			.scaleExtent([0.02, 40])
+			.scaleExtent([ZOOM_EXTENT[0], ZOOM_EXTENT[1]])
 			.on("zoom", ({ transform }) => {
 				this.transform = transform;
 				this.markDirty();
@@ -791,7 +626,7 @@ export class GraphCanvasRenderer {
 		const w = this.canvas.clientWidth;
 		const h = this.canvas.clientHeight;
 		if (w < 10 || h < 10) return; // layout not ready yet; the ResizeObserver retries
-		const t = fitTransform(this.worldBBox, w, h, 40);
+		const t = fitTransform(this.worldBBox, w, h, FIT_PADDING);
 		this.kFit = t.k;
 		this.hasFit = true;
 		select(this.canvas).call(
@@ -807,7 +642,7 @@ export class GraphCanvasRenderer {
 		if (!this.worldBBox) return;
 		const w = this.canvas.clientWidth;
 		const h = this.canvas.clientHeight;
-		if (w >= 10 && h >= 10) this.kFit = fitTransform(this.worldBBox, w, h, 40).k;
+		if (w >= 10 && h >= 10) this.kFit = fitTransform(this.worldBBox, w, h, FIT_PADDING).k;
 	}
 
 	destroy(): void {
@@ -837,7 +672,7 @@ export class GraphCanvasRenderer {
 		const { x, y } = this.eventPos(e);
 		const current = this.zoomTarget?.k ?? this.transform.k;
 		// Must stay inside the zoomBehavior's scaleExtent [0.02, 40].
-		const k = Math.min(Math.max(current * Math.exp(delta), 0.02), 40);
+		const k = Math.min(Math.max(current * Math.exp(delta), ZOOM_EXTENT[0]), ZOOM_EXTENT[1]);
 		this.zoomTarget = { k, x, y };
 		// Fresh easing clock so the glide starts gentle, never half-done.
 		this.lastTickAt = performance.now();
@@ -1171,30 +1006,20 @@ export class GraphCanvasRenderer {
 		// at the center and its arrowhead lands on the conclusion's disc
 		// edge. Single-premise arguments arrive here as ordinary
 		// proposition→proposition edges and draw exactly like any arrow.
-		const arrowLen = settings.arrowLength;
+		const glyphs = edgeGlyphs(data.edges, this.nodeById, isVisible, nodeR, settings.arrowLength);
 		const shafts = new Path2D();
 		const heads = new Path2D();
-		for (const e of data.edges) {
-			if (!isVisible(e.from) || !isVisible(e.to)) continue;
-			const a = this.nodeById.get(e.from);
-			const b = this.nodeById.get(e.to);
-			if (!a || !b) continue;
-			const intoImp = isImpNodeId(e.to);
-			const outOfImp = isImpNodeId(e.from);
-			const g = arrowGeometry(a, b, outOfImp ? 0 : nodeR, intoImp ? 0 : nodeR, arrowLen);
-			if (!g) continue;
-			shafts.moveTo(g.shaftFrom.x, g.shaftFrom.y);
-			if (intoImp) {
-				// toRadius 0 put the tip AT the imp node's center: the
-				// headless shaft terminates there (no head triangle).
-				shafts.lineTo(g.tip.x, g.tip.y);
-			} else {
-				shafts.lineTo(g.shaftTo.x, g.shaftTo.y);
-				heads.moveTo(g.tip.x, g.tip.y);
-				heads.lineTo(g.left.x, g.left.y);
-				heads.lineTo(g.right.x, g.right.y);
-				heads.closePath();
-			}
+		const sh = glyphs.shafts;
+		for (let i = 0; i < sh.length; i += 4) {
+			shafts.moveTo(sh[i]!, sh[i + 1]!);
+			shafts.lineTo(sh[i + 2]!, sh[i + 3]!);
+		}
+		const hd = glyphs.heads;
+		for (let i = 0; i < hd.length; i += 6) {
+			heads.moveTo(hd[i]!, hd[i + 1]!);
+			heads.lineTo(hd[i + 2]!, hd[i + 3]!);
+			heads.lineTo(hd[i + 4]!, hd[i + 5]!);
+			heads.closePath();
 		}
 		this.shaftsPath = shafts;
 		this.headsPath = heads;
@@ -1210,9 +1035,10 @@ export class GraphCanvasRenderer {
 		const ctx = this.ctx;
 		const prevFont = ctx.font;
 		ctx.font = this.worldLabelFont;
-		const maxW = LABEL_MAX_WIDTH * (settings.labelSize / LABEL_SIZE);
+		const maxW = labelWrapWidth(settings.labelSize);
+		const measure = (text: string) => ctx.measureText(text).width;
 		for (const n of data.nodes) {
-			if (isVisible(n.id) && !isImpNodeId(n.id)) this.labelLines.set(n.id, wrapLabel(ctx, n.label, maxW));
+			if (isVisible(n.id) && !isImpNodeId(n.id)) this.labelLines.set(n.id, wrapLabel(n.label, maxW, measure));
 		}
 		ctx.font = prevFont;
 	}
@@ -1278,63 +1104,18 @@ export class GraphCanvasRenderer {
 		const isVisible = (id: string): boolean => !visible || visible.has(id);
 
 		const tuning = this.regionTuning;
-		// Dilation is WORLD units (the 2026-09-15 pivot) — the region stroke
-		// half-width comes straight from the setting, no kFit.
-
-		// World rect over VISIBLE cluster members (regions cover members
-		// and their intra-cluster edges — nothing else).
-		let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity;
-		for (const c of data.clusters) {
-			for (const id of c.members) {
-				if (!isVisible(id)) continue;
-				const n = this.nodeById.get(id);
-				if (!n) continue;
-				if (n.x < minX) minX = n.x;
-				if (n.x > maxX) maxX = n.x;
-				if (n.y < minY) minY = n.y;
-				if (n.y > maxY) maxY = n.y;
-			}
-		}
-		if (minX > maxX) {
-			this.regionCanvas = null;
-			this.regionRect = null;
-			this.regionMeta = [];
-			return;
-		}
-
-		// Which cluster is a node in (for intra-cluster edges)?
-		const clusterOf = new Map<string, number>();
-		data.clusters.forEach((c, i) => {
-			for (const id of c.members) clusterOf.set(id, i);
-		});
-
 		// Label anchors ALWAYS compute (cheap — a centroid pass, no canvas):
 		// cluster labels follow their own `clusterLabels` setting and must
 		// survive the region paint being turned off.
-		this.regionMeta = [];
-		data.clusters.forEach((cluster) => {
-			let members = 0;
-			let sumX = 0;
-			let sumY = 0;
-			for (const id of cluster.members) {
-				if (!isVisible(id)) continue;
-				const n = this.nodeById.get(id);
-				if (!n) continue;
-				members++;
-				sumX += n.x;
-				sumY += n.y;
-			}
-			if (members > 0) {
-				this.regionMeta.push({
-					id: cluster.id,
-					label: cluster.label || null,
-					cx: sumX / members,
-					cy: sumY / members,
-					hue: clusterHue(cluster.id),
-					lines: null,
-				});
-			}
-		});
+		this.regionMeta = regionAnchors(data.clusters, this.nodeById, isVisible).map((a) => ({
+			...a,
+			lines: null,
+		}));
+		if (this.regionMeta.length === 0) {
+			this.regionCanvas = null;
+			this.regionRect = null;
+			return;
+		}
 
 		// Wrap the region labels ONCE per geometry build, at their
 		// SCREEN-fixed size (viewer-relative labels — this px size is what
@@ -1363,34 +1144,17 @@ export class GraphCanvasRenderer {
 			return;
 		}
 
-		// Bitmap sizing: longest world span maps to `bitmap` px. The rect
-		// is padded by the stroke half-width (dilation) plus the blur
-		// reach so nothing clips at the bitmap edge.
-		//
-		// The blur reach is WORLD units (the 2026-09-15 pivot's last step):
-		// tuning.blur IS the world reach, canonical like dilation — it no
-		// longer scales with the graph's span (the old blurW = blur ×
-		// span/bitmap read 6× softer on a 338-node graph than on a
-		// 13-node one). This also makes the 2026-09-14 search-collapse fix
-		// structural: a world-unit blur cannot be coupled to any cell, so
-		// the old `cellRef` anchor is gone.
-		const dilationW = tuning.dilation;
-		const blurW = tuning.blur;
-		const padWorld = dilationW + blurW * 2;
-		// Cell floor: a single visible node (span 0) zeroed the cell and
-		// blew the bitmap dims to Infinity (getImageData TypeError). The
-		// floor is the padded rect's own reach, so dims stay finite (long
-		// side ≤ bitmap · (1 + span/2·pad)) however tight the search.
-		const spanNow = Math.max(maxX - minX, maxY - minY);
-		const cell = Math.max(spanNow, padWorld * 2) / tuning.bitmap;
-		minX -= padWorld;
-		minY -= padWorld;
-		maxX += padWorld;
-		maxY += padWorld;
-		const spanX = maxX - minX;
-		const spanY = maxY - minY;
-		const bw = Math.max(1, Math.ceil(spanX / cell));
-		const bh = Math.max(1, Math.ceil(spanY / cell));
+		// The splat plan (src/core regionSplat): the bitmap size, the cell,
+		// and the round-cap strokes and discs of each cluster. Dilation and
+		// blur are WORLD units (the 2026-09-15 pivot).
+		const plan = regionSplat(data.clusters, data.edges, this.nodeById, isVisible, tuning);
+		if (!plan) {
+			this.regionCanvas = null;
+			this.regionRect = null;
+			return;
+		}
+		const bw = plan.width;
+		const bh = plan.height;
 		let rc = this.regionCanvas;
 		if (!rc) {
 			rc = document.createElement("canvas");
@@ -1407,112 +1171,41 @@ export class GraphCanvasRenderer {
 		if (!rctx) return;
 		rctx.clearRect(0, 0, bw, bh);
 		rctx.lineCap = "round";
-		rctx.lineWidth = (dilationW * 2) / cell;
+		rctx.lineWidth = plan.lineWidth;
 
 		// The region IS the dilated skeleton: intra-cluster edges as
-		// round-cap strokes (Minkowski dilation). NO blanket per-node discs
-		// — they double-counted where nodes sit on edges (user-identified
-		// hot spots, when clusters were edge-based).
-		data.clusters.forEach((cluster, ci) => {
-			const hue = clusterHue(cluster.id);
-			// Full-opacity strokes: alpha is applied ONCE at the very end
-			// (dilate at 1 → blur → scale by edgeAlpha). Baking per-stroke
-			// alpha in here made source-over stacking ACCUMULATE it — an
-			// orphan disc overlapping anything read as a darker double-
-			// counted spot (user report 2026-09-14). At alpha 1 the alpha
-			// channel is a pure coverage indicator: overlaps of any count
-			// contribute exactly 1.0.
-			rctx.strokeStyle = `hsla(${hue}, 65%, ${data.colors.clusterLightness.ring}%, 1)`;
+		// round-cap strokes, plus one disc for each member no stroke reached
+		// (every member is painted once, never twice). Full-opacity paint:
+		// alpha is applied ONCE at the very end (dilate at 1 → blur → scale
+		// by edgeAlpha), so overlaps of any count contribute exactly 1.0.
+		for (const layer of plan.layers) {
+			const color = `hsla(${layer.hue}, 65%, ${data.colors.clusterLightness.ring}%, 1)`;
+			rctx.strokeStyle = color;
 			rctx.beginPath();
-			// Endpoints actually covered by a stroke's round caps.
-			const touched = new Set<string>();
-			for (const e of data.edges) {
-				if (clusterOf.get(e.from) !== ci) continue;
-				if (clusterOf.get(e.to) !== ci) continue;
-				// Search filter: stroke only fully-visible edges. Invisible-node
-				// segments still stroked into the (visible-only) bitmap cut
-				// diagonal hue streaks across other clusters' regions (user-
-				// reported 2026-09-14) — rect, discs, and anchors already filter.
-				if (!isVisible(e.from) || !isVisible(e.to)) continue;
-				const a = this.nodeById.get(e.from);
-				const b = this.nodeById.get(e.to);
-				if (!a || !b) continue;
-				rctx.moveTo((a.x - minX) / cell, (a.y - minY) / cell);
-				rctx.lineTo((b.x - minX) / cell, (b.y - minY) / cell);
-				touched.add(e.from);
-				touched.add(e.to);
+			const sg = layer.segments;
+			for (let i = 0; i < sg.length; i += 4) {
+				rctx.moveTo(sg[i]!, sg[i + 1]!);
+				rctx.lineTo(sg[i + 2]!, sg[i + 3]!);
 			}
 			rctx.stroke();
-
-			// Member discs for the SEMANTIC era (DECIDED 2026-09-13): clusters
-			// are now topics by meaning, and many members (orphans, isolated
-			// micro-topics) share NO intra-cluster edge with anyone — edge
-			// strokes alone left them completely uncolored. A disc (same
-			// radius as a round cap = dilation) covers exactly the members no
-			// stroke reached: every member is painted by its edges' caps OR
-			// one disc, never both — the no-double-counting rule survives.
-			rctx.fillStyle = `hsla(${hue}, 65%, ${data.colors.clusterLightness.ring}%, 1)`;
-			const discR = dilationW / cell;
-			for (const id of cluster.members) {
-				if (touched.has(id) || !isVisible(id)) continue;
-				const n = this.nodeById.get(id);
-				if (!n) continue;
+			rctx.fillStyle = color;
+			const dc = layer.discs;
+			for (let i = 0; i < dc.length; i += 2) {
 				rctx.beginPath();
-				rctx.arc((n.x - minX) / cell, (n.y - minY) / cell, discR, 0, Math.PI * 2);
+				rctx.arc(dc[i]!, dc[i + 1]!, plan.discR, 0, Math.PI * 2);
 				rctx.fill();
 			}
-		});
+		}
 
 		// THE blur + alpha (in that order, by design — user-decided
-		// 2026-09-14): 3 box-blur rounds on the premultiplied bitmap,
-		// THEN scale the whole field by edgeAlpha once. Bilinear
-		// upscaling alone is no blur at all (tent ramps — the JPEG look);
-		// this makes the field genuinely smooth before the blit. The
-		// radius is the world reach ÷ cell, rounded to an integer
-		// (boxBlurRound indexes with the loop counter) with a 1px floor —
-		// a graph whose cell exceeds the blur reach still gets one pixel
-		// of softening rather than aliasing to zero. Radius 0 (blur off)
-		// still runs this path — boxBlurRound
-		// copies — so the end-alpha applies uniformly with or without
-		// blur.
-		{
-			const blurPx = tuning.blur > 0 ? Math.max(1, Math.round(blurW / cell)) : 0;
-			const img = rctx.getImageData(0, 0, bw, bh);
-			const n = bw * bh * 4;
-			const a = new Float32Array(n);
-			for (let i = 0; i < n; i += 4) {
-				const alpha = img.data[i + 3]! / 255;
-				a[i] = img.data[i]! * alpha;
-				a[i + 1] = img.data[i + 1]! * alpha;
-				a[i + 2] = img.data[i + 2]! * alpha;
-				a[i + 3] = img.data[i + 3]!;
-			}
-			const b = new Float32Array(n);
-			const tmp = new Float32Array(n); // scratch inside each round only
-			boxBlurRound(a, tmp, b, bw, bh, blurPx); // a → b
-			boxBlurRound(b, tmp, a, bw, bh, blurPx); // b → a
-			boxBlurRound(a, tmp, b, bw, bh, blurPx); // a → b (result)
-			// Unpremultiply back into pixels; scale the alpha by edgeAlpha
-			// HERE — the one, final application. Result: constant interior
-			// alpha everywhere covered, tapering only across the blur edges.
-			for (let i = 0; i < n; i += 4) {
-				const alpha = b[i + 3]!;
-				if (alpha <= 0) {
-					img.data[i] = 0;
-					img.data[i + 1] = 0;
-					img.data[i + 2] = 0;
-					img.data[i + 3] = 0;
-				} else {
-					// Un-premultiply: pm = c * a/255, so c = pm / a * 255.
-					img.data[i] = Math.round((b[i]! / alpha) * 255);
-					img.data[i + 1] = Math.round((b[i + 1]! / alpha) * 255);
-					img.data[i + 2] = Math.round((b[i + 2]! / alpha) * 255);
-					img.data[i + 3] = Math.round(alpha * tuning.edgeAlpha);
-				}
-			}
-			rctx.putImageData(img, 0, 0);
-		}
-		this.regionRect = { minX, minY, w: spanX, h: spanY };
+		// 2026-09-14): 3 box-blur rounds on the premultiplied bitmap, THEN
+		// scale the whole field by edgeAlpha once (src/core
+		// blurRegionPixels). Radius 0 (blur off) still runs this path, so
+		// the end-alpha applies uniformly with or without blur.
+		const img = rctx.getImageData(0, 0, bw, bh);
+		blurRegionPixels(img.data, bw, bh, plan.blurPx, tuning.edgeAlpha);
+		rctx.putImageData(img, 0, 0);
+		this.regionRect = plan.rect;
 	}
 
 	/** THE draw function: every layer, one frame, one camera. All drawing
