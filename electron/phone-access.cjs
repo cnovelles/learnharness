@@ -61,6 +61,10 @@ const ROUTES = [
 const MAX_FOLDER_TEXT = 200;
 /** The gateway refuses a new folder when the Mac already has this many. */
 const MAX_FOLDERS = 500;
+/** A checked write must send its whole body in this time. */
+const WRITE_BODY_TIMEOUT_MS = 10 * 1000;
+/** The longest time one checked write holds the queue. */
+const WRITE_HOLD_MS = 30 * 1000;
 const CONTROL_CHARS = /[\u0000-\u001f\u007f-\u009f\u2028\u2029]/;
 /** The keys of each folder action (fork src/core/source-organization.ts). */
 const FOLDER_ACTION_KEYS = {
@@ -105,12 +109,15 @@ const PHONE_WRITES = [
 		pattern: /^\/api\/graph\/sources$/,
 		maxBytes: 4 * 1024,
 		check: checkFolderAction,
-		/** Reads the folder list only before a new folder. */
+		/** Reads the folder list only before a new folder. The gateway runs
+		 * the writes of this entry one at a time, so two new folders at the
+		 * same time cannot both pass the count. */
 		limit: async (body, readJSON) => {
 			if (body.action !== "create-folder") return null;
 			const directory = await readJSON("/api/graph/sources");
-			const count = Array.isArray(directory?.organization?.folders) ? directory.organization.folders.length : 0;
-			return count >= MAX_FOLDERS ? { status: 409, error: `This Mac has the most folders it can keep (${MAX_FOLDERS}). Delete a folder first.`, code: "folder-limit" } : null;
+			const folders = directory?.organization?.folders;
+			if (!Array.isArray(folders)) throw new Error("the folder list is not valid");
+			return folders.length >= MAX_FOLDERS ? { status: 409, error: `This Mac has the most folders it can keep (${MAX_FOLDERS}). Delete a folder first.`, code: "folder-limit" } : null;
 		},
 	},
 ];
@@ -212,7 +219,13 @@ function readJSONBody(req, limit = 64 * 1024, destroyOnOverflow = true) {
 			}
 			chunks.push(chunk);
 		});
+		let ended = false;
+		// A destroyed request (a timeout, a lost phone) sends no "end".
+		req.on("close", () => {
+			if (!ended && !over) reject(Object.assign(new Error("request closed"), { status: 400 }));
+		});
 		req.on("end", () => {
+			ended = true;
 			try {
 				resolve(chunks.length ? JSON.parse(Buffer.concat(chunks).toString("utf8")) : {});
 			} catch {
@@ -240,8 +253,9 @@ const HOP_HEADERS = new Set(["connection", "keep-alive", "transfer-encoding", "u
  * @param {(device: {id: string, name: string}) => void} [options.onPaired] called after a phone pairs
  * @param {(reason: "too-many-attempts") => void} [options.onPairingCancelled] called when wrong codes cancel the active code
  * @param {() => ReturnType<typeof os.networkInterfaces>} [options.networkInterfaces] the network interfaces (tests replace it)
+ * @param {number} [options.writeBodyTimeoutMs] the time a checked write has to send its body (tests make it short)
  */
-function createPhoneGateway({ store, target, tlsDir, info = {}, log = () => {}, now = () => Date.now(), onPaired = () => {}, onPairingCancelled = () => {}, networkInterfaces = () => os.networkInterfaces() }) {
+function createPhoneGateway({ store, target, tlsDir, info = {}, log = () => {}, now = () => Date.now(), onPaired = () => {}, onPairingCancelled = () => {}, networkInterfaces = () => os.networkInterfaces(), writeBodyTimeoutMs = WRITE_BODY_TIMEOUT_MS }) {
 	let server = null;
 	let certificate = null; // {key, cert, pin}, loaded by start()
 	// The active one-use code. `failures` counts wrong codes against THIS code
@@ -253,6 +267,9 @@ function createPhoneGateway({ store, target, tlsDir, info = {}, log = () => {}, 
 	const sockets = new Set();
 	// Open proxied requests by device id, so a revoke closes them at once.
 	const activeByDevice = new Map(); // deviceId -> Set<{res, upstream}>
+	// The checked writes run one at a time (check, limit, server answer), so
+	// a limit cannot be passed by two writes at the same time.
+	let writeQueue = Promise.resolve();
 
 	function startPairing() {
 		const code = randomToken(18);
@@ -418,13 +435,30 @@ function createPhoneGateway({ store, target, tlsDir, info = {}, log = () => {}, 
 		if (type !== "application/json") return refuse(415, "The request must be JSON.");
 		if (Number(req.headers["content-length"] ?? 0) > write.maxBytes) return refuse(413, "Request body too large.");
 		let body;
+		let timedOut = false;
+		const slow = setTimeout(() => {
+			timedOut = true;
+			req.destroy();
+		}, writeBodyTimeoutMs);
 		try {
 			body = await readJSONBody(req, write.maxBytes, false);
 		} catch (err) {
+			if (timedOut) return res.destroy();
 			return err.status === 413 ? refuse(413, "Request body too large.") : sendJSON(res, 400, { error: "The request must be JSON." });
+		}
+		finally {
+			clearTimeout(slow);
 		}
 		const problem = write.check(body);
 		if (problem) return sendJSON(res, 400, { error: problem });
+		const turn = writeQueue.then(() => runWrite(req, res, url, device, write, body));
+		writeQueue = turn.catch(() => {});
+		return turn;
+	}
+
+	/** One checked write, in the queue: the limit, then the server, until the answer ends. */
+	async function runWrite(req, res, url, device, write, body) {
+		if (res.destroyed) return;
 		let refusal;
 		try {
 			refusal = await write.limit(body, readUpstreamJSON);
@@ -433,7 +467,17 @@ function createPhoneGateway({ store, target, tlsDir, info = {}, log = () => {}, 
 			return sendJSON(res, 502, { error: "The LearnHarness server is not reachable." });
 		}
 		if (refusal) return sendJSON(res, refusal.status, { error: refusal.error, code: refusal.code });
-		proxy(req, res, url, device, Buffer.from(JSON.stringify(body), "utf8"));
+		// The phone can be removed while its write waits: check it again.
+		if (!store.read().devices.some((d) => d.id === device.id)) return sendJSON(res, 401, { error: "This phone is not paired, or its pairing was removed." });
+		// The next write waits for this answer, but never more than WRITE_HOLD_MS.
+		await new Promise((resolve) => {
+			const hold = setTimeout(resolve, WRITE_HOLD_MS);
+			res.once("close", () => {
+				clearTimeout(hold);
+				resolve();
+			});
+			proxy(req, res, url, device, Buffer.from(JSON.stringify(body), "utf8"));
+		});
 	}
 
 	/** @param {Buffer} [body] a body that the gateway already read and checked */
