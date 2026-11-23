@@ -73,7 +73,16 @@ import { SettingsSlider as SettingSlider } from "@/components/settings/controls"
 import Link from "next/link";
 import { FileTextIcon, ListTreeIcon, Loader2Icon, SearchIcon, SettingsIcon, WaypointsIcon } from "lucide-react";
 import { graphFolderIds, graphFolderVisibleIds, incrementalLayout, propositionSessionHref, type GraphCostSummary, type GraphNode, type GraphSnapshot } from "@/src/core";
-import { planCostLabel } from "@/components/usage-format";
+import {
+	graphCostStageRows,
+	graphUsageLabel,
+	pipelineRunSeconds,
+	recentRunCostLabel,
+	runTimeAgo,
+	stageCostLabel,
+	stageTokensLabel,
+	stageUnpricedCount,
+} from "@/src/core";
 import { CLUSTER_LIGHTNESS, GraphCanvasRenderer, type GraphRenderSettings } from "./graph-canvas.ts";
 import { displayCostTotals, isNodeVisible, seedMissingNodePositions } from "@/src/core";
 
@@ -209,40 +218,6 @@ function sizeDisplay(v: number): string {
 	return `${v >= 1 ? Math.round(v * 10) / 10 : Math.round(v * 100) / 100}`;
 }
 
-/** Compact token display: 45231 → "45.2k"; absent → "—". */
-function fmtTokens(n: number | undefined): string {
-	if (n === undefined) return "—";
-	if (n < 1000) return String(Math.round(n));
-	if (n < 1_000_000) return `${(n / 1000).toFixed(1)}k`;
-	return `${(n / 1_000_000).toFixed(2)}M`;
-}
-
-/** Relative time for run rows: "now", "12m", "3h", "2d". */
-function timeAgo(startedAt: number): string {
-	const mins = Math.round((Date.now() - startedAt) / 60_000);
-	if (mins < 1) return "now";
-	if (mins < 60) return `${mins}m`;
-	const hours = Math.round(mins / 60);
-	if (hours < 24) return `${hours}h`;
-	return `${Math.round(hours / 24)}d`;
-}
-
-/** Run/stage cost at 3 decimals (pipeline pennies are real money at this
- *  scale); headline totals use 2. Null (unpriced model) renders "—". */
-function fmtRunCost(dollars: number | null, providers: readonly string[] = []): string {
-	return planCostLabel(dollars, providers, (value) => `$${value.toFixed(3)}`);
-}
-function graphProviders(value: { subscriptionRuns?: number; subscriptionProviders?: string[] }): string[] {
-	return value.subscriptionProviders ?? ((value.subscriptionRuns ?? 0) > 0 ? ["ChatGPT"] : []);
-}
-function graphUsageLabel(costs: Pick<GraphCostSummary, "stages">): string {
-	const stages = [costs.stages.extraction, costs.stages.audit];
-	const providers = [...new Set(stages.flatMap(graphProviders))];
-	const priced = stages.some((stage) => stage.runs - stage.unpricedRuns - (stage.subscriptionRuns ?? 0) > 0);
-	const dollars = displayCostTotals(costs).totalDollars;
-	return planCostLabel(priced ? dollars : null, providers, (value) => `$${value.toFixed(2)}`);
-}
-
 /**
  * The graph-pipeline cost control (2026-09-20 placement wave): a bare
  * cumulative-dollars number — no pill chrome (owner: "just a number"),
@@ -297,10 +272,7 @@ export function GraphCostControl({ costs }: { costs: GraphCostSummary }) {
  * naming-kind runs never reach the list.
  */
 function GraphCostPanel({ costs }: { costs: GraphCostSummary }) {
-	const stageRows: [string, GraphCostSummary["stages"]["extraction"]][] = [
-		["Extraction", costs.stages.extraction],
-		["Audit", costs.stages.audit],
-	];
+	const stageRows = graphCostStageRows(costs);
 	// The displayed figures come from displayCostTotals (naming excluded —
 	// the pill and this panel must agree).
 	const { unpricedRuns } = displayCostTotals(costs);
@@ -322,13 +294,13 @@ function GraphCostPanel({ costs }: { costs: GraphCostSummary }) {
 					<div key={label} className="flex items-baseline justify-between gap-2 text-[11px]">
 						<span className="shrink-0 text-muted-foreground">{label}</span>
 						<span className="min-w-0 text-right tabular-nums">
-							{fmtRunCost(stage.runs - stage.unpricedRuns - (stage.subscriptionRuns ?? 0) <= 0 ? null : stage.dollars, graphProviders(stage))}
-							{stage.unpricedRuns > 0 && (stage.runs - stage.unpricedRuns - (stage.subscriptionRuns ?? 0) > 0 || (stage.subscriptionRuns ?? 0) > 0) && (
-								<span className="text-muted-foreground"> +{stage.unpricedRuns} unpriced</span>
+							{stageCostLabel(stage)}
+							{stageUnpricedCount(stage) !== null && (
+								<span className="text-muted-foreground"> +{stageUnpricedCount(stage)} unpriced</span>
 							)}
 							<span className="text-muted-foreground">
 								{" "}
-								· {fmtTokens(stage.tokens.inputTokens)} in / {fmtTokens(stage.tokens.outputTokens)} out
+								· {stageTokensLabel(stage)}
 							</span>
 						</span>
 					</div>
@@ -338,7 +310,7 @@ function GraphCostPanel({ costs }: { costs: GraphCostSummary }) {
 				{costs.runs.map((run) => (
 						<div key={run.startedAt} className="flex items-baseline justify-between gap-2 text-[11px]">
 							<span className="min-w-0 flex-1 truncate text-muted-foreground">
-								<span className="text-foreground/70">{timeAgo(run.startedAt)}</span>{" "}
+								<span className="text-foreground/70">{runTimeAgo(run.startedAt)}</span>{" "}
 								{run.title}
 								{run.merged && (
 									<span className="text-muted-foreground">
@@ -347,7 +319,7 @@ function GraphCostPanel({ costs }: { costs: GraphCostSummary }) {
 									</span>
 								)}
 							</span>
-							<span className="shrink-0 tabular-nums">{fmtRunCost(run.dollars, graphProviders(run))}{run.dollars === null && run.subscriptionRuns === 1 ? " +1 unpriced" : ""}</span>
+							<span className="shrink-0 tabular-nums">{recentRunCostLabel(run)}</span>
 						</div>
 					))}
 			</div>
@@ -1585,7 +1557,7 @@ export function GraphView({
 					<Loader2Icon className="size-3.5 shrink-0 animate-spin" />
 					<span className="capitalize">{run.phase}</span>
 					<span className="max-w-48 truncate text-foreground">{run.title}</span>
-					<span className="tabular-nums">{Math.max(0, Math.round((Date.now() - run.startedAt) / 1000))}s</span>
+					<span className="tabular-nums">{pipelineRunSeconds(run.startedAt)}s</span>
 				</div>
 			))}
 			</div>

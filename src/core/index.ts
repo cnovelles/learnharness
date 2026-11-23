@@ -28,6 +28,7 @@ export * from "./source-label.ts";
 export * from "./chain-rows.ts";
 export * from "./usage-format.ts";
 export * from "./graph-view-model.ts";
+export * from "./graph-cost-format.ts";
 export * from "./graph-canvas-geometry.ts";
 export * from "./folder-order.ts";
 export * from "./render-settings.ts";
