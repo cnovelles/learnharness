@@ -46,6 +46,9 @@ const ROUTES = [
 	{ methods: ["GET", "PUT"], pattern: /^\/api\/chats\/[^/]+$/ },
 	{ methods: ["GET"], pattern: /^\/api\/chats\/[^/]+\/(stream|markdown)$/ },
 	{ methods: ["POST"], pattern: /^\/api\/chats\/[^/]+\/(dismiss|steer|artifact-ui)$/ },
+	// Issue 19 (D-017): a learner photo under a figure. Read only; the
+	// route itself reads only the session's own snapshots.
+	{ methods: ["GET"], pattern: /^\/api\/chats\/[^/]+\/images\/[a-f0-9]{64}$/ },
 	{ methods: ["PUT"], pattern: /^\/api\/chats\/[^/]+\/settings$/ },
 	{ methods: ["GET"], pattern: /^\/api\/events$/ },
 	{ methods: ["GET"], pattern: /^\/api\/activity$/ },
