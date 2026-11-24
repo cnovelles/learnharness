@@ -25,5 +25,5 @@ export function readThemeBoot(): ThemeBoot {
 	const id = appearance?.theme;
 	const custom = id && !isBuiltinThemeId(id) ? themeStore.readTheme(id) : null;
 	const theme = resolveTheme(id, custom ? [custom] : []);
-	return { appearance, theme, vars: themeVars(effectiveColors(theme, appearance), theme.mode) };
+	return { appearance, theme, vars: themeVars(effectiveColors(theme, appearance), theme.mode, theme.buttons) };
 }

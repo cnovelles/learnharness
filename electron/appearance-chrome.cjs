@@ -7,6 +7,8 @@ const path = require("node:path");
 
 const PRESET_APPEARANCE = {
 	default: { mode: "dark", background: "#141414" },
+	"orbitutor-light": { mode: "light", background: "#faf9f5" },
+	classic: { mode: "dark", background: "#141414" },
 	"catppuccin-latte": { mode: "light", background: "#eff1f5" },
 	"catppuccin-frappe": { mode: "dark", background: "#303446" },
 	"catppuccin-macchiato": { mode: "dark", background: "#24273a" },

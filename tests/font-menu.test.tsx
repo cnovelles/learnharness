@@ -12,6 +12,7 @@ import fs from "node:fs";
 import { renderWithInteractionLayers as renderToStaticMarkup } from "./interaction-layer-render.tsx";
 import { describe, it } from "node:test";
 import { FontMenuList, customFamilyFor, fontMenuResults } from "../components/settings/model-menu";
+import { BUILTIN_THEMES, DEFAULT_THEME } from "../src/core/index.ts";
 import {
 	CURATED_FALLBACK_FONTS,
 	DEFAULT_READING_FONT,
@@ -139,23 +140,22 @@ describe("the emphasis-ink factory ruling (globals.css)", () => {
 		assert.ok(!css.includes("--lh-ink-italic: #6fa9d6"), "italic factory is not the old blue");
 	});
 
-	it("the Default theme's inks are the regular text color", () => {
-		const css = fs.readFileSync("app/globals.css", "utf-8");
-		const text = css.match(/--foreground: (#[0-9a-f]{6});/)?.[1];
-		assert.ok(text, "the factory text color");
-		assert.ok(css.includes(`--lh-ink-strong: ${text};`), "bold ink = text");
-		assert.ok(css.includes(`--lh-ink-italic: ${text};`), "italic ink = text");
+	it("the Classic theme's inks are the regular text color", () => {
+		// Issue 22: the OrbiTutor default has its own inks (palette "Grove");
+		// the old factory palette, now "Classic", keeps the ruling.
+		const classic = BUILTIN_THEMES.find((t) => t.id === "classic")!;
+		assert.equal(classic.colors.bold, classic.colors.text, "bold ink = text");
+		assert.equal(classic.colors.italic, classic.colors.text, "italic ink = text");
+		assert.equal(classic.colors.code, classic.colors.text, "code ink = text");
 	});
 
-	it("the bold and italic override rows' empty-state hints name the text color", () => {
+	it("the bold and italic override rows' empty-state hints name the default theme's inks", () => {
 		const html = renderToStaticMarkup(
 			<AppearanceSection appearance={undefined} onSectionChange={() => true} />,
 		);
-		const text = html.match(/data-testid="row-color-text"[\s\S]*?Empty = (#[0-9a-f]{6})/)?.[1];
-		assert.ok(text, "the text row's hint");
-		for (const key of ["bold", "italic"]) {
+		for (const key of ["bold", "italic"] as const) {
 			const hint = html.match(new RegExp(`data-testid="row-color-${key}"[\\s\\S]*?Empty = (#[0-9a-f]{6})`))?.[1];
-			assert.equal(hint, text, `${key} row`);
+			assert.equal(hint, DEFAULT_THEME.colors[key], `${key} row`);
 		}
 		assert.ok(!html.includes("#ee928c"));
 		assert.ok(!html.includes("#6fa9d6"));

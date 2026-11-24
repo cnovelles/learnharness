@@ -81,7 +81,7 @@ export function appearanceVars(
 	a: ReturnType<typeof resolveAppearance>,
 	theme: Theme,
 ): Record<string, string> {
-	const vars: Record<string, string> = themeVars(effectiveColors(theme, a), theme.mode);
+	const vars: Record<string, string> = themeVars(effectiveColors(theme, a), theme.mode, theme.buttons);
 	if (a.fontFamily !== null) {
 		const bundled = BUNDLED_READING_FONTS[a.fontFamily];
 		vars["--font-prose"] = `"${a.fontFamily}", ${bundled ? `${bundled}, ` : ""}var(--font-sans3), ui-sans-serif, system-ui, sans-serif`;
@@ -191,7 +191,7 @@ export function AppearanceProvider({
 	// A refreshed server layout can rewrite <html>'s class/style while the
 	// mounted provider retains a newer local save. Reapply that live state
 	// when the server-rendered palette changes, even within the same mode.
-	const serverKey = JSON.stringify(themeVars(effectiveColors(initialTheme, initialAppearance), initialTheme.mode));
+	const serverKey = JSON.stringify(themeVars(effectiveColors(initialTheme, initialAppearance), initialTheme.mode, initialTheme.buttons));
 	const key = useMemo(() => JSON.stringify([vars, serverKey]), [vars, serverKey]);
 	// REMOVAL is half the job (owner repro, fix wave): a later write that
 	// OMITS a var (empty font = factory, serif toggle back on) must clear

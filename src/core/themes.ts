@@ -60,11 +60,21 @@ export type ColorOverrideKey = (typeof COLOR_OVERRIDE_KEYS)[number];
 /** `appearance.colors`: hex wins over the theme; null/absent = the theme's color. */
 export type AppearanceColorOverrides = Partial<Record<ColorOverrideKey, string | null>>;
 
+/** Filled buttons (`--primary`). Optional: without it a button takes the
+ *  text color on the page color, as before. Issue 22 (OrbiTutor): the
+ *  OrbiTutor presets fill buttons with the logo green. Not a user override
+ *  key; an import may carry it. */
+export interface ThemeButtons {
+	primary: string;
+	onPrimary: string;
+}
+
 /** The file / JSON shape (import and export). */
 export interface ThemeFile {
 	name: string;
 	mode: ThemeMode;
 	colors: ThemeColors;
+	buttons?: ThemeButtons;
 }
 
 /** A theme in the catalog: a preset (`builtin`) or an imported file,
@@ -74,7 +84,10 @@ export interface Theme extends ThemeFile {
 	builtin: boolean;
 }
 
-/** The theme a record without `appearance.theme` renders. */
+/** The theme a record without `appearance.theme` renders. Issue 22: this
+ *  id is now the OrbiTutor "Grove" palette (dark). The settings factory
+ *  writes "default", so every record that never chose a theme moves to
+ *  OrbiTutor. The old palette is the "classic" preset. */
 export const DEFAULT_THEME_ID = "default";
 
 /** #rgb / #rrggbb (case-insensitive). Mirrors settings.isHexColor without
@@ -100,7 +113,13 @@ export function parseThemeFile(raw: unknown): { ok: true; theme: ThemeFile } | {
 		if (!isHex(c[key])) return { ok: false, error: `colors.${key} must be a #hex color` };
 		colors[key] = c[key];
 	}
-	return { ok: true, theme: { name: r.name.trim(), mode: r.mode, colors } };
+	if (r.buttons === undefined) return { ok: true, theme: { name: r.name.trim(), mode: r.mode, colors } };
+	const b = r.buttons as Record<string, unknown> | null;
+	if (!b || typeof b !== "object" || Array.isArray(b)) return { ok: false, error: "buttons must be an object" };
+	if (!isHex(b.primary)) return { ok: false, error: "buttons.primary must be a #hex color" };
+	if (!isHex(b.onPrimary)) return { ok: false, error: "buttons.onPrimary must be a #hex color" };
+	const buttons = { primary: b.primary, onPrimary: b.onPrimary };
+	return { ok: true, theme: { name: r.name.trim(), mode: r.mode, colors, buttons } };
 }
 
 /** The sanitizer form: the theme, or null when anything is off. */
@@ -125,12 +144,16 @@ export function isThemeId(value: unknown): value is string {
 	return typeof value === "string" && /^[a-z0-9]+(?:-[a-z0-9]+)*$/.test(value) && value.length <= 64;
 }
 
-function builtin(name: string, mode: ThemeMode, c: ThemeColors): Theme {
-	return { id: themeIdFromName(name), name, mode, colors: c, builtin: true };
+function builtin(name: string, mode: ThemeMode, c: ThemeColors, buttons?: ThemeButtons): Theme {
+	return { id: themeIdFromName(name), name, mode, colors: c, builtin: true, ...(buttons ? { buttons } : {}) };
 }
 
-/** The presets, in grid order. Default = the app's original dark palette
- *  (app/globals.css carries it as literals; tests pin the two equal).
+/** The presets, in grid order. OrbiTutor = the default (issue 22, palette
+ *  "Grove", user choice 2026-11-23): the issue 18 neutrals with the logo
+ *  green for buttons, links and rings; every pair passes WCAG AA.
+ *  app/globals.css carries it as literals; tests pin the two equal.
+ *  Classic = the app's original dark palette (id "classic"; it was the
+ *  Default before issue 22).
  *  Catppuccin: base/surface0/surface1, mauve accent, lavender/pink/peach
  *  emphasis; Latte takes mantle/surface0 instead, because surface0 on a
  *  light page reads as a heavy gray slab, and Frappé's bold is flamingo
@@ -144,7 +167,24 @@ function builtin(name: string, mode: ThemeMode, c: ThemeColors): Theme {
 export const BUILTIN_THEMES: readonly Theme[] = [
 	{
 		id: DEFAULT_THEME_ID,
-		name: "Default",
+		name: "OrbiTutor",
+		mode: "dark",
+		builtin: true,
+		colors: {
+			background: "#141414", surface: "#1c1c1c", border: "#3a3a3a", text: "#e6e6e6", textMuted: "#9a9a9a",
+			accent: "#38d892", bold: "#f2f2f2", italic: "#8fe3bb", code: "#f0a37f",
+			error: "#f26b6b", success: "#38d892", warning: "#f2b544",
+		},
+		buttons: { primary: "#2fd08a", onPrimary: "#0b2117" },
+	},
+	builtin("OrbiTutor Light", "light", {
+		background: "#faf9f5", surface: "#f0eee6", border: "#e0ddd2", text: "#3d3d3a", textMuted: "#67665f",
+		accent: "#0b7a4b", bold: "#22221f", italic: "#0b7a4b", code: "#a8502f",
+		error: "#b83232", success: "#0b7a4b", warning: "#8a5e12",
+	}, { primary: "#0b7a4b", onPrimary: "#ffffff" }),
+	{
+		id: "classic",
+		name: "Classic",
 		mode: "dark",
 		builtin: true,
 		colors: {
@@ -205,8 +245,8 @@ export const BUILTIN_THEMES: readonly Theme[] = [
 	}),
 ];
 
-/** The app's original dark palette, and the fallback for a missing id. */
-export const DEFAULT_THEME: Theme = BUILTIN_THEMES[0]!;
+/** The default theme (OrbiTutor), and the fallback for a missing id. */
+export const DEFAULT_THEME: Theme = BUILTIN_THEMES.find((t) => t.id === DEFAULT_THEME_ID)!;
 
 /** Preset ids are reserved: imports never take them, DELETE refuses them. */
 export function isBuiltinThemeId(id: string): boolean {
@@ -255,7 +295,7 @@ const HOVER_STEP = 14;
  *  `--accent` stays the shadcn HOVER surface (derived from `surface`, so
  *  hovers never turn the highlight color); the theme's accent is
  *  `--lh-accent` (ring, toggles, the selected theme card). */
-export function themeVars(c: ThemeColors, mode: ThemeMode): Record<string, string> {
+export function themeVars(c: ThemeColors, mode: ThemeMode, buttons?: ThemeButtons): Record<string, string> {
 	return {
 		"--background": c.background,
 		"--foreground": c.text,
@@ -263,8 +303,8 @@ export function themeVars(c: ThemeColors, mode: ThemeMode): Record<string, strin
 		"--card-foreground": c.text,
 		"--popover": c.surface,
 		"--popover-foreground": c.text,
-		"--primary": c.text,
-		"--primary-foreground": c.background,
+		"--primary": buttons?.primary ?? c.text,
+		"--primary-foreground": buttons?.onPrimary ?? c.background,
 		"--secondary": c.surface,
 		"--secondary-foreground": c.text,
 		"--muted": c.surface,
