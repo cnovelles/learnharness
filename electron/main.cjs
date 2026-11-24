@@ -282,6 +282,7 @@ function waitUntilUp(url, tries = 150) {
 }
 
 function killServer() {
+	void phoneAccess?.stop(); // mobile fork: inside the one quit cleanup listener
 	chatgpt?.close();
 	subscriptions?.close();
 	if (!serverProcess) return;
@@ -763,10 +764,10 @@ async function main() {
 		file: path.join(app.getPath("userData"), "phone-access.json"),
 		tlsDir: path.join(app.getPath("userData"), "phone-access-tls"),
 		target: () => ({ url, secret: desktopAPISecret }),
-		info: { name: require("node:os").hostname(), version: app.getVersion() },
+		// Lazy: read only when a phone pairs or pings (test harnesses fake app without getVersion).
+		info: { name: require("node:os").hostname(), get version() { return app.getVersion(); } },
 		log,
 	});
-	app.on("before-quit", () => void phoneAccess?.stop());
 	await phoneAccess.startIfEnabled();
 
 	// Renderer controls contain no token/URL/code operation. The separate server
