@@ -1,25 +1,13 @@
 "use client";
 
 import { useCallback, useMemo, useRef, useState, type ReactNode } from "react";
-import { CLAUDE_CODE_PROVIDER, sessionCacheHitRate, subscriptionLabels, subscriptionLabel, type cliContextWindowOf, type SessionPricing, type TurnUsage } from "@/src/core";
-import { formatTokens, formatUsd, planCostLabel, prettyModel } from "@/components/usage-format";
-import { ModelControl, catalogLimits, useModelCatalog } from "@/components/model-picker";
+import { catalogLimits, sessionStatsSummary, type cliContextWindowOf, type SessionPricing, type TurnUsage } from "@/src/core";
+import { ModelControl, useModelCatalog } from "@/components/model-picker";
 import { usePopoverDismiss } from "@/components/popover-dismiss";
 import { INTERACTION_LAYER_Z_BASE } from "@/components/host-dialog";
 
-export function formatContextMeasurement(tokens: number | null, limit: number | null): string {
-	const numerator = tokens === null ? "?" : formatTokens(tokens);
-	return limit === null ? numerator : `${numerator} / ${formatTokens(limit)}`;
-}
-
-/** CLI aliases have no global catalog limit: only this session's matching
- * response can supply a denominator. Other providers keep their catalog join. */
-export function contextLimitForModel(model: string | undefined, limits: ReadonlyMap<string, number> | undefined,
-	cliWindow: ReturnType<typeof cliContextWindowOf> = null): number | null {
-	if (!model) return null;
-	if (model.startsWith(`${CLAUDE_CODE_PROVIDER}:`)) return cliWindow?.model === model ? cliWindow.tokens : null;
-	return limits?.get(model) ?? null;
-}
+/** The context format helpers live in core (the phone shares them). */
+export { contextLimitForModel, formatContextMeasurement } from "@/src/core";
 
 /**
  * The below-composer stats bar (wave 4 observability): the session's
@@ -85,16 +73,14 @@ export function StatsBar({
 	// scoped; unknown metadata always means usage-only, never a guessed maximum.
 	const { catalog } = useModelCatalog();
 	const limits = useMemo(() => (catalog ? catalogLimits(catalog) : undefined), [catalog]);
-	const limit = contextLimitForModel(selectedModel, limits, cliContextWindow);
-	const contextLabel = formatContextMeasurement(contextTokens, limit);
-	const cacheHitRate = useMemo(() => sessionCacheHitRate({ turns }), [turns]);
-	const { cost = 0, unpriced = turns.length, subscription = 0 } = pricing ?? {};
-	// Honest cost: show dollars only when at least one turn priced;
-	// otherwise "—" (never a fake $0.0000).
-	const pricedCount = turns.length - unpriced - subscription;
-	const providers = pricing?.subscriptionProviders ?? subscriptionLabels(turns.map((turn) => turn.model));
-	const cliBilled = turns.some((turn) => turn.model.startsWith(`${CLAUDE_CODE_PROVIDER}:`));
-	const costLabel = planCostLabel(pricedCount > 0 ? cost : null, cliBilled ? [...providers, "CLI"] : providers);
+	// The strings live in core (src/core/session-stats.ts): the phone app
+	// shows the same ones. Honest cost: "—" when no turn priced, never a
+	// fake $0.0000.
+	const summary = useMemo(
+		() => sessionStatsSummary({ turns, pricing, contextTokens, model: selectedModel, limits, cliWindow: cliContextWindow }),
+		[turns, pricing, contextTokens, selectedModel, limits, cliContextWindow],
+	);
+	const { context: contextLabel, cost: costLabel, costTitle, cacheHitRate, unpriced, providers } = summary;
 
 	return (
 		<div
@@ -150,11 +136,11 @@ export function StatsBar({
 									{contextLabel}
 								</span>
 							</div>
-							{selectedModel?.startsWith(`${CLAUDE_CODE_PROVIDER}:`) && (
+							{summary.cliModel && (
 								<p>Window reported by Claude Code; may be lower for auto-compaction.</p>
 							)}
 							<div className="flex justify-between gap-2">
-								<span>{subscription ? "Usage" : "Total cost"}</span>
+								<span>{costTitle}</span>
 								<span className="tabular-nums text-card-foreground">{costLabel}</span>
 							</div>
 							{cacheHitRate !== null && (
@@ -178,15 +164,15 @@ export function StatsBar({
 								</div>
 								<ul className="flex max-h-56 flex-col gap-1 overflow-y-auto">
 									{turns.map((turn, i) => {
-										const c = pricing?.turnCosts[turn.id] ?? null;
+										const row = summary.turns[i]!;
 										return (
 											<li key={`${turn.messageId}-${i}`} className="flex items-center justify-between gap-2">
 												<span className="truncate text-muted-foreground">
-													#{i + 1} · {prettyModel(turn.model, true)}
+													{row.label}
 												</span>
 												<span className="flex shrink-0 items-center gap-2 tabular-nums text-card-foreground">
-													<span className="text-muted-foreground">{turn.steps.length} steps</span>
-													<span>{turn.model.startsWith(`${CLAUDE_CODE_PROVIDER}:`) ? "CLI" : subscriptionLabel(turn.model) ?? (c === null ? "—" : formatUsd(c))}</span>
+													<span className="text-muted-foreground">{row.steps} steps</span>
+													<span>{row.cost}</span>
 												</span>
 											</li>
 										);

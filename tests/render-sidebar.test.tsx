@@ -28,6 +28,7 @@ function item(overrides: Partial<ChatListItem>): ChatListItem {
 		phase: "probe",
 		pendingQuestion: false,
 		pendingProblem: false,
+		problemCount: 0,
 		busy: false,
 		compacting: false,
 		...overrides,
@@ -44,6 +45,18 @@ describe("SessionRow", () => {
 		assert.ok(!html.includes("phase-strip"), "strip removed by design (too busy)");
 		assert.ok(!html.includes("bg-phase-"), "phase fills are retired app-wide");
 		assert.ok(!html.includes("border-phase-"), "phase rings are retired app-wide");
+	});
+
+	it("compact rows use monospace, hide metadata and preserve the practice icon and spinner", () => {
+		const chat = item({ kind: "practice", pendingQuestion: true, busy: true });
+		const html = renderToStaticMarkup(<SessionRow chat={chat} active={false} compact onOpen={() => {}} />);
+		assert.match(html, /\bh-8\b/);
+		assert.match(html, /\bfont-ui\b[^>]*>Test session/);
+		assert.match(html, /hover:bg-accent/);
+		assert.doesNotMatch(html, /transition-colors|duration-\d/);
+		assert.doesNotMatch(html, /Waiting for input|2026-01-02|session-dot/);
+		assert.match(html, /braille-spinner/);
+		assert.match(html, /aria-label="Practice session"/);
 	});
 
 	it("idle session: NO indicator — absence is the state", () => {

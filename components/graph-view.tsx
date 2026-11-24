@@ -64,14 +64,31 @@
  */
 
 import { useCallback, useDeferredValue, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
+import { createPortal } from "react-dom";
+import { GraphFolderFilterControl, useGraphFolderSelection } from "@/components/graph-folder-filter";
+import { useSourceDirectory } from "@/components/source-directory";
 import { NotesImportControl, NotesImportErrors, NotesImportNotices, useNotesImport } from "@/components/notes-import.tsx";
 import { PluginGraphActions } from "@/components/plugin-chrome";
 import { SettingsSlider as SettingSlider } from "@/components/settings/controls";
 import Link from "next/link";
 import { FileTextIcon, ListTreeIcon, Loader2Icon, SearchIcon, SettingsIcon, WaypointsIcon } from "lucide-react";
-import { incrementalLayout, propositionSessionHref, type GraphCostSummary, type GraphNode, type GraphSnapshot } from "@/src/core";
-import { planCostLabel } from "@/components/usage-format";
+import { graphFolderIds, graphFolderVisibleIds, incrementalLayout, propositionSessionHref, type GraphCostSummary, type GraphNode, type GraphSnapshot } from "@/src/core";
+import {
+	graphCostStageRows,
+	graphUsageLabel,
+	pipelineRunSeconds,
+	recentRunCostLabel,
+	runTimeAgo,
+	stageCostLabel,
+	stageTokensLabel,
+	stageUnpricedCount,
+} from "@/src/core";
 import { CLUSTER_LIGHTNESS, GraphCanvasRenderer, type GraphRenderSettings } from "./graph-canvas.ts";
+import { displayCostTotals, isNodeVisible, seedMissingNodePositions } from "@/src/core";
+
+// The pure view helpers live in src/core (the phone shares them); the old
+// names stay importable from here.
+export { displayCostTotals, isNodeVisible, seedMissingNodePositions };
 import { useAppearance } from "@/components/settings/appearance";
 import { usePopoverDismiss } from "@/components/popover-dismiss";
 import { INTERACTION_LAYER_Z_BASE } from "@/components/host-dialog";
@@ -131,15 +148,19 @@ const CAMERA_STORAGE_KEY = "lh.graph.camera.v1";
 
 type RenderSettings = GraphRenderSettings;
 
-/**
- * Pure filter predicate for the search panel: a node is visible when the
- * query is empty or matches its name or statement (case-insensitive).
- * Exported for tests; the visibility feed just consumes its verdict.
- */
-export function isNodeVisible(node: Pick<GraphNode, "name" | "statement">, query: string): boolean {
-	const q = query.trim().toLowerCase();
-	if (!q) return true;
-	return node.name.toLowerCase().includes(q) || node.statement.toLowerCase().includes(q);
+/** Search alone retains its existing behavior. With an active folder filter,
+ * a junction can only draw if every endpoint survives the combined view. */
+export function graphVisibleIds(snapshot: Pick<GraphSnapshot, "nodes" | "impLinks">, query: string, folderVisibleIds: ReadonlySet<string> | null): Set<string> {
+	const visible = new Set<string>();
+	for (const node of snapshot.nodes) {
+		if ((folderVisibleIds === null || folderVisibleIds.has(node.id)) && isNodeVisible(node, query)) visible.add(node.id);
+	}
+	if (folderVisibleIds !== null && query.trim()) {
+		for (const { id, premises, conclusion } of snapshot.impLinks) {
+			if (!visible.has(conclusion) || !premises.every((premise) => visible.has(premise))) visible.delete(id);
+		}
+	}
+	return visible;
 }
 
 /** In-place sessions patch for a live rename (rename-shuffle fix,
@@ -155,49 +176,6 @@ export function isNodeVisible(node: Pick<GraphNode, "name" | "statement">, query
  *  the server derives the same join on its next read. */
 export function renameSessionsPatch(snapshot: Pick<GraphSnapshot, "sessions">, id: string, title: string): void {
 	snapshot.sessions[id] = title;
-}
-
-/** Seed positions for nodes the ledger doesn't know yet (hygiene,
- *  2026-09-23 fix wave): they used to fall through to a ?? 0 and dump
- *  at the origin. Place them on a deterministic ring around the known
- *  positions' centroid — angle hashed from the id (FNV-1a), golden-angle
- *  spiral offset so even hash collisions spread. Stable across
- *  remounts, far enough off the mass to see, and they relax with the
- *  pack on the next drag. In-place on the provided map; pure otherwise. */
-export function seedMissingNodePositions(
-	nodes: readonly { id: string }[],
-	positions: Map<string, { x: number; y: number }>,
-): Map<string, { x: number; y: number }> {
-	if (positions.size === 0 || nodes.every((n) => positions.has(n.id))) return positions;
-	let minX = Infinity;
-	let minY = Infinity;
-	let maxX = -Infinity;
-	let maxY = -Infinity;
-	for (const p of positions.values()) {
-		if (p.x < minX) minX = p.x;
-		if (p.y < minY) minY = p.y;
-		if (p.x > maxX) maxX = p.x;
-		if (p.y > maxY) maxY = p.y;
-	}
-	const cx = (minX + maxX) / 2;
-	const cy = (minY + maxY) / 2;
-	const radius = Math.max(maxX - minX, maxY - minY, 40) * 0.7 + 20;
-	const missing = nodes.filter((n) => !positions.has(n.id));
-	missing.forEach((n, i) => {
-		// FNV-1a hash → [0,1) → angle; the golden-angle spiral offset
-		// both spreads collisions and staggers long paths deterministically.
-		let h = 0x811c9dc5;
-		for (let c = 0; c < n.id.length; c++) {
-			h ^= n.id.charCodeAt(c);
-			h = (h * 0x01000193) >>> 0;
-		}
-		const angle = ((h / 0xffffffff) * 2 * Math.PI + i * 2.39996323) % (2 * Math.PI);
-		positions.set(n.id, {
-			x: cx + Math.cos(angle) * radius,
-			y: cy + Math.sin(angle) * radius,
-		});
-	});
-	return positions;
 }
 
 // ---- Color helpers (canvas wants hex, not oklch) ---------------------------
@@ -238,61 +216,6 @@ interface Selection {
 /** Compact size display for the log sliders: "2", "1.6", "0.75". */
 function sizeDisplay(v: number): string {
 	return `${v >= 1 ? Math.round(v * 10) / 10 : Math.round(v * 100) / 100}`;
-}
-
-/** Compact token display: 45231 → "45.2k"; absent → "—". */
-function fmtTokens(n: number | undefined): string {
-	if (n === undefined) return "—";
-	if (n < 1000) return String(Math.round(n));
-	if (n < 1_000_000) return `${(n / 1000).toFixed(1)}k`;
-	return `${(n / 1_000_000).toFixed(2)}M`;
-}
-
-/** Relative time for run rows: "now", "12m", "3h", "2d". */
-function timeAgo(startedAt: number): string {
-	const mins = Math.round((Date.now() - startedAt) / 60_000);
-	if (mins < 1) return "now";
-	if (mins < 60) return `${mins}m`;
-	const hours = Math.round(mins / 60);
-	if (hours < 24) return `${hours}h`;
-	return `${Math.round(hours / 24)}d`;
-}
-
-/** Run/stage cost at 3 decimals (pipeline pennies are real money at this
- *  scale); headline totals use 2. Null (unpriced model) renders "—". */
-function fmtRunCost(dollars: number | null, providers: readonly string[] = []): string {
-	return planCostLabel(dollars, providers, (value) => `$${value.toFixed(3)}`);
-}
-function graphProviders(value: { subscriptionRuns?: number; subscriptionProviders?: string[] }): string[] {
-	return value.subscriptionProviders ?? ((value.subscriptionRuns ?? 0) > 0 ? ["ChatGPT"] : []);
-}
-function graphUsageLabel(costs: Pick<GraphCostSummary, "stages">): string {
-	const stages = [costs.stages.extraction, costs.stages.audit];
-	const providers = [...new Set(stages.flatMap(graphProviders))];
-	const priced = stages.some((stage) => stage.runs - stage.unpricedRuns - (stage.subscriptionRuns ?? 0) > 0);
-	const dollars = displayCostTotals(costs).totalDollars;
-	return planCostLabel(priced ? dollars : null, providers, (value) => `$${value.toFixed(2)}`);
-}
-
-/**
- * The cost figures the UI DISPLAYS (owner refinement round, 2026-09-24):
- * extraction + audit only. Cluster naming is dead — labels are session
- * titles / file names — so the core's naming fold (and its historical
- * spend) is deliberately not shown anywhere: the pill and the panel must
- * agree, and both read THIS, never GraphCostSummary.totalDollars.
- * (The core fold's naming stage was then culled outright — 2026-09-24 —
- * so the recent-runs list carries extraction runs only.)
- */
-export function displayCostTotals(costs: Pick<GraphCostSummary, "stages">): {
-	totalDollars: number;
-	unpricedRuns: number;
-} {
-	// The two live stages (the spine came and went on one day,
-	// 2026-09-30 — digest-aware extraction replaced it).
-	return {
-		totalDollars: costs.stages.extraction.dollars + costs.stages.audit.dollars,
-		unpricedRuns: costs.stages.extraction.unpricedRuns + costs.stages.audit.unpricedRuns,
-	};
 }
 
 /**
@@ -349,10 +272,7 @@ export function GraphCostControl({ costs }: { costs: GraphCostSummary }) {
  * naming-kind runs never reach the list.
  */
 function GraphCostPanel({ costs }: { costs: GraphCostSummary }) {
-	const stageRows: [string, GraphCostSummary["stages"]["extraction"]][] = [
-		["Extraction", costs.stages.extraction],
-		["Audit", costs.stages.audit],
-	];
+	const stageRows = graphCostStageRows(costs);
 	// The displayed figures come from displayCostTotals (naming excluded —
 	// the pill and this panel must agree).
 	const { unpricedRuns } = displayCostTotals(costs);
@@ -374,13 +294,13 @@ function GraphCostPanel({ costs }: { costs: GraphCostSummary }) {
 					<div key={label} className="flex items-baseline justify-between gap-2 text-[11px]">
 						<span className="shrink-0 text-muted-foreground">{label}</span>
 						<span className="min-w-0 text-right tabular-nums">
-							{fmtRunCost(stage.runs - stage.unpricedRuns - (stage.subscriptionRuns ?? 0) <= 0 ? null : stage.dollars, graphProviders(stage))}
-							{stage.unpricedRuns > 0 && (stage.runs - stage.unpricedRuns - (stage.subscriptionRuns ?? 0) > 0 || (stage.subscriptionRuns ?? 0) > 0) && (
-								<span className="text-muted-foreground"> +{stage.unpricedRuns} unpriced</span>
+							{stageCostLabel(stage)}
+							{stageUnpricedCount(stage) !== null && (
+								<span className="text-muted-foreground"> +{stageUnpricedCount(stage)} unpriced</span>
 							)}
 							<span className="text-muted-foreground">
 								{" "}
-								· {fmtTokens(stage.tokens.inputTokens)} in / {fmtTokens(stage.tokens.outputTokens)} out
+								· {stageTokensLabel(stage)}
 							</span>
 						</span>
 					</div>
@@ -390,7 +310,7 @@ function GraphCostPanel({ costs }: { costs: GraphCostSummary }) {
 				{costs.runs.map((run) => (
 						<div key={run.startedAt} className="flex items-baseline justify-between gap-2 text-[11px]">
 							<span className="min-w-0 flex-1 truncate text-muted-foreground">
-								<span className="text-foreground/70">{timeAgo(run.startedAt)}</span>{" "}
+								<span className="text-foreground/70">{runTimeAgo(run.startedAt)}</span>{" "}
 								{run.title}
 								{run.merged && (
 									<span className="text-muted-foreground">
@@ -399,7 +319,7 @@ function GraphCostPanel({ costs }: { costs: GraphCostSummary }) {
 									</span>
 								)}
 							</span>
-							<span className="shrink-0 tabular-nums">{fmtRunCost(run.dollars, graphProviders(run))}{run.dollars === null && run.subscriptionRuns === 1 ? " +1 unpriced" : ""}</span>
+							<span className="shrink-0 tabular-nums">{recentRunCostLabel(run)}</span>
 						</div>
 					))}
 			</div>
@@ -950,7 +870,11 @@ export function GraphView({
 	practiceSelection,
 	onPracticeSelectionChange,
 	onChainSelectClose,
+	folderFilterSlot,
 }: {
+	/** Where the folder filter control portals: the home header's top-left
+	 *  chrome, after the sidebar toggle. Absent → no folder filter control. */
+	folderFilterSlot?: HTMLElement | null;
 	/** PRACTICE SELECT (owner vision, 2026-10-04): the LIFTED, persistent
 	 *  pick set — every check/clear in the chain table (however opened)
 	 *  reports the full node list up immediately; the composer-side chip
@@ -1043,16 +967,32 @@ export function GraphView({
 	const rendererRef = useRef<GraphCanvasRenderer | null>(null);
 	const posRef = useRef<Map<string, { x: number; y: number }> | null>(null);
 
-	// The id set that survives the current search — consumed by the
-	// visibility feed and the "no matches" hint.
-	const visibleIds = useMemo(() => {
-		const set = new Set<string>();
-		if (snapshot)
-			for (const node of snapshot.nodes) {
-				if (isNodeVisible(node, query)) set.add(node.id);
-			}
-		return set;
-	}, [snapshot, query]);
+	// FOLDER FILTER (approved plan): view only. The shared organization's
+	// placements map sources to folders; a proposition shows when ANY of its
+	// surviving sources sits in a ticked folder (subfolders included when
+	// ticked). Search and folder filter both apply.
+	const { directory: sourceDirectoryState } = useSourceDirectory(true);
+	const organization = sourceDirectoryState?.organization;
+	const { selected: folderSelection, setSelected: setFolderSelection } = useGraphFolderSelection(organization);
+	const listedFolders = useMemo(() => {
+		if (!organization || !snapshot) return new Set<string>();
+		const sources = new Set<string>();
+		for (const node of snapshot.propositions) for (const id of snapshot.nodeSessions[node.id] ?? []) sources.add(id);
+		return graphFolderIds(organization, sources);
+	}, [organization, snapshot]);
+	const folderVisibleIds = useMemo(() => !organization || !snapshot ? null : graphFolderVisibleIds({
+		organization,
+		selected: folderSelection,
+		listed: listedFolders,
+		propositionIds: snapshot.propositions.map((node) => node.id),
+		nodeSources: snapshot.nodeSessions,
+		impLinks: snapshot.impLinks,
+	}), [organization, snapshot, folderSelection, listedFolders]);
+	const filtering = query.trim() !== "" || folderVisibleIds !== null;
+	// The id set that survives the current search AND folder filter —
+	// consumed by the visibility feed and the "no matches" hint.
+	const visibleIds = useMemo(() => snapshot ? graphVisibleIds(snapshot, query, folderVisibleIds) : new Set<string>(),
+		[snapshot, query, folderVisibleIds]);
 
 	// Fetch the derived graph. Re-runs when a background pipeline run
 	// finishes (refreshTick) — its merges just landed in the ledger.
@@ -1437,10 +1377,10 @@ export function GraphView({
 	// Feed #3 — visibility: hidden nodes drop out of rendering, picking,
 	// hover, AND labels; edges drop when either endpoint is hidden.
 	useEffect(() => {
-		rendererRef.current?.setVisible(query.trim() ? visibleIds : null);
+		rendererRef.current?.setVisible(filtering ? visibleIds : null);
 		// The open detail card cannot outlive its node's visibility.
 		setSelected((sel) => (sel && visibleIds.has(sel.node.id) ? sel : null));
-	}, [visibleIds, query]);
+	}, [visibleIds, filtering, isEmpty]);
 
 	// Feed #4 — region tuning. `isEmpty` in the deps (same as Feed #2):
 	// the settings fetch resolves BEFORE the snapshot creates the renderer,
@@ -1581,6 +1521,11 @@ export function GraphView({
 				{/* The actions row (empty-graph chrome wave, owner 2026-09-25):
 				    Import Notes always — the empty graph's entry point; search +
 				    settings only when nodes exist, fading in on their mount. */}
+				{folderFilterSlot && !isEmpty && organization && createPortal(
+					<GraphFolderFilterControl organization={organization} listed={listedFolders}
+						selected={folderSelection} onChange={setFolderSelection} />,
+					folderFilterSlot,
+				)}
 				<GraphChromeRow
 					isEmpty={isEmpty}
 					query={query}
@@ -1612,7 +1557,7 @@ export function GraphView({
 					<Loader2Icon className="size-3.5 shrink-0 animate-spin" />
 					<span className="capitalize">{run.phase}</span>
 					<span className="max-w-48 truncate text-foreground">{run.title}</span>
-					<span className="tabular-nums">{Math.max(0, Math.round((Date.now() - run.startedAt) / 1000))}s</span>
+					<span className="tabular-nums">{pipelineRunSeconds(run.startedAt)}s</span>
 				</div>
 			))}
 			</div>

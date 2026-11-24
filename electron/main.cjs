@@ -24,7 +24,7 @@
  *     would shadow every settings-page key change until restart.
  */
 
-const { app, BrowserWindow, Menu, ipcMain, nativeTheme, session, shell, dialog } = require("electron");
+const { app, BrowserWindow, Menu, clipboard, ipcMain, nativeTheme, session, shell, dialog } = require("electron");
 const { pickAttachmentPath } = require("./attachment-picker.cjs");
 const { createChatGPT, fileStore } = require("./chatgpt.cjs");
 const { attachChatGPTChild, trustedSender, chatGPTControl } = require("./chatgpt-ipc.cjs");
@@ -32,6 +32,7 @@ const { createSubscriptions, loadSubscriptionSDK } = require("./subscriptions.cj
 const { attachSubscriptionChild, subscriptionControl } = require("./subscription-ipc.cjs");
 const { desktopAPIHeaders } = require("./desktop-api.cjs");
 const { openWebSubscriptionBrowser } = require("./web-subscription-browser.cjs");
+const { createPhoneAccess } = require("./phone-access-window.cjs");
 const { randomBytes } = require("node:crypto");
 const { spawn } = require("node:child_process");
 const fs = require("node:fs");
@@ -44,6 +45,10 @@ const path = require("node:path");
 const SIDEBAR_AUTOCLOSE = 928;
 
 const PRODUCT_NAME = "LearnHarness";
+// Mobile fork: upstream auto-update is off. LH_FORK_UPSTREAM_UPDATES=1 turns
+// it back on (the upstream updater tests use it to keep that code covered).
+const FORK_UPDATES_DISABLED = process.env.LH_FORK_UPSTREAM_UPDATES !== "1";
+let phoneAccess = null; // mobile fork: phone gateway + its window
 
 // APP NAME → userData (owner, 2026-10-10): the Application Support dir is
 // exactly "LearnHarness" in dev AND packaged. Packaged Electron would
@@ -277,6 +282,7 @@ function waitUntilUp(url, tries = 150) {
 }
 
 function killServer() {
+	void phoneAccess?.stop(); // mobile fork: inside the one quit cleanup listener
 	chatgpt?.close();
 	subscriptions?.close();
 	if (!serverProcess) return;
@@ -317,7 +323,7 @@ function openExternalLink(target) {
  *  - will-navigate pinned to the app origin; window.open always denied —
  *    external links go to the real browser via shell.openExternal, for
  *    http, https and mailto only (openExternalLink). */
-function createWindow(url) {
+function createWindow(url, beforeLoad) {
 	const win = new BrowserWindow({
 		width: 1440,
 		height: 900,
@@ -403,6 +409,7 @@ function createWindow(url) {
 		return { action: "deny" };
 	});
 
+	beforeLoad?.(win);
 	void win.loadURL(url);
 	// Zoom truth reaches the renderer for EVERY load (reload, nav): the
 	// renderer's --lh-zoom must never go stale. The fallback catcher below
@@ -536,6 +543,13 @@ function installUpdateNow() {
 }
 
 function setupAutoUpdater() {
+	// Mobile fork: an upstream update would replace this fork and remove phone
+	// access. Merge upstream releases into the fork manually instead.
+	if (FORK_UPDATES_DISABLED) {
+		log("auto-update: mobile fork — updater disabled");
+		reportUpdateStatus("disabled");
+		return;
+	}
 	if (!app.isPackaged) {
 		log("auto-update: dev build — updater disabled");
 		reportUpdateStatus("disabled");
@@ -621,6 +635,8 @@ function installMenu() {
 				{ role: "about" },
 				// Manual checks report their result in Settings → General.
 				{ label: "Check for Updates…", click: () => checkForUpdatesFromMenu() },
+				{ type: "separator" },
+				{ label: "Phone Access…", click: () => phoneAccess?.openWindow() },
 				{ type: "separator" },
 				{ role: "hide" },
 				{ role: "hideOthers" },
@@ -742,6 +758,18 @@ async function main() {
 		}
 	}
 
+	// Mobile fork: the phone gateway forwards to the same loopback server.
+	phoneAccess = createPhoneAccess({
+		electron: { BrowserWindow, ipcMain, shell, clipboard },
+		file: path.join(app.getPath("userData"), "phone-access.json"),
+		tlsDir: path.join(app.getPath("userData"), "phone-access-tls"),
+		target: () => ({ url, secret: desktopAPISecret }),
+		// Lazy: read only when a phone pairs or pings (test harnesses fake app without getVersion).
+		info: { name: require("node:os").hostname(), get version() { return app.getVersion(); } },
+		log,
+	});
+	await phoneAccess.startIfEnabled();
+
 	// Renderer controls contain no token/URL/code operation. The separate server
 	// child is the only recipient of credential leases over inherited IPC.
 	ipcMain.handle("lh:chatgpt:control", async (event, command) => {
@@ -777,7 +805,15 @@ async function main() {
 	// interval fire after it below. setupAutoUpdater's contract: failures
 	// are log lines — this can never block boot.
 	setupAutoUpdater();
-	ipcMain.on("lh:update-install", () => installUpdateNow());
+	// Same sender rule as lh:update:get/check. ipcMain.on has no reply channel,
+	// so an untrusted request is dropped and logged.
+	ipcMain.on("lh:update-install", (event) => {
+		if (!trustedAppWindows.has(BrowserWindow.fromWebContents(event.sender)) || !trustedSender(event, new URL(url).origin, BrowserWindow)) {
+			log("auto-update: ignored install request from an untrusted sender");
+			return;
+		}
+		installUpdateNow();
+	});
 	ipcMain.handle("lh:update:get", (event) => {
 		if (!trustedAppWindows.has(BrowserWindow.fromWebContents(event.sender)) || !trustedSender(event, new URL(url).origin, BrowserWindow)) throw new Error("Untrusted desktop request.");
 		return updateState;
@@ -814,7 +850,17 @@ async function main() {
 	app.on("activate", () => {
 		if (BrowserWindow.getAllWindows().length === 0) reopenWindow();
 	});
-	createWindow(url);
+	createWindow(url, firstWindow => {
+		const fromFirstWindow = event => !firstWindow.isDestroyed() && event.sender === firstWindow.webContents &&
+			trustedSender(event, new URL(url).origin, BrowserWindow);
+		let messages;
+		if (app.isPackaged && !devUrl) {
+			const { dismissalStore, startMessages } = require("./startup-messages.cjs");
+			messages = startMessages(firstWindow, dismissalStore(app.getPath("userData")));
+		}
+		ipcMain.handle("lh:startup-message:take", event => messages && fromFirstWindow(event) ? messages.take() : null);
+		ipcMain.handle("lh:startup-message:dismiss", (event, id) => !!messages && fromFirstWindow(event) && messages.dismiss(id));
+	});
 	log(`window open: ${url}`);
 	// Startup + 24h checks stay main-owned and read the current preference.
 	// No renderer subscription is required; late loads retrieve the snapshot.

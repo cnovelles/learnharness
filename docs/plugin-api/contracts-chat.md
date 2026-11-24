@@ -366,6 +366,7 @@ export interface ChatSummary {
     phase: Phase3;
     pendingQuestion: boolean;
     pendingProblem: boolean;
+    problemCount: number;
     settings?: ChatSettings;
 }
 ```
@@ -383,6 +384,7 @@ export interface ChatSummary {
 - [phase](#chatsummary-phase)
 - [pendingQuestion](#chatsummary-pendingquestion)
 - [pendingProblem](#chatsummary-pendingproblem)
+- [problemCount](#chatsummary-problemcount)
 - [settings](#chatsummary-settings)
 
 ### ChatSummary id
@@ -446,6 +448,15 @@ A practice problem is posed but not concluded. False on teaching sessions.
 
 ```ts
 pendingProblem: boolean;
+```
+
+### ChatSummary problemCount
+
+Problems posed through a clean result (the waiting one included).
+Zero on teaching sessions.
+
+```ts
+problemCount: number;
 ```
 
 ### ChatSummary settings

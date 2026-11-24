@@ -13,12 +13,13 @@ const mainFile = fileURLToPath(new URL("../electron/main.cjs", import.meta.url))
 const mainSource = readFileSync(mainFile, "utf8");
 const mainRequire = createRequire(mainFile);
 
-function fixture({ packaged = true, updaterMissing = false } = {}) {
+function fixture({ packaged = true, updaterMissing = false, forkUpdates = true } = {}) {
 	let settings: string | Error = JSON.stringify({ version: 1, general: { autoUpdate: true } });
 	const settingsReads: string[] = [];
 	const order: string[] = [];
 	const intervals: { callback: () => void; delay: number }[] = [];
 	const handles = new Map<string, (event: unknown) => unknown>();
+	const listeners = new Map<string, (event: unknown) => void>();
 	const windows: FakeWindow[] = [];
 	let enumerationFails = false;
 	let userData = "/fixture/custom-user-data";
@@ -71,6 +72,7 @@ function fixture({ packaged = true, updaterMissing = false } = {}) {
 	const app = Object.assign(new EventEmitter(), {
 		isPackaged: packaged,
 		name: "LearnHarness",
+		getVersion: () => "0.0.0-test", // mobile fork: phone access reads it at startup
 		setName() {},
 		getPath: () => userData,
 		setPath: (_: string, value: string) => { userData = value; },
@@ -81,7 +83,7 @@ function fixture({ packaged = true, updaterMissing = false } = {}) {
 	const electron = {
 		app, BrowserWindow: FakeWindow,
 		Menu: { buildFromTemplate: (value: typeof menu) => value, setApplicationMenu: (value: typeof menu) => { menu = value; } },
-		ipcMain: { on() {}, handle: (channel: string, fn: (event: unknown) => unknown) => handles.set(channel, fn) },
+		ipcMain: { on: (channel: string, fn: (event: unknown) => void) => listeners.set(channel, fn), handle: (channel: string, fn: (event: unknown) => unknown) => handles.set(channel, fn) },
 		nativeTheme: { shouldUseDarkColors: true, themeSource: "system", on() {} },
 		session: { defaultSession: { setPermissionRequestHandler() {}, setPermissionCheckHandler() {} } },
 	};
@@ -104,7 +106,8 @@ function fixture({ packaged = true, updaterMissing = false } = {}) {
 			};
 			return mainRequire(id);
 		},
-		process: { argv: [], env: { LH_DEV_URL: "http://127.0.0.1:9000" }, platform: "darwin", on() {} },
+		// Mobile fork: upstream updates are off by default; this suite covers the upstream updater code.
+		process: { argv: [], env: { LH_DEV_URL: "http://127.0.0.1:9000", ...(forkUpdates ? { LH_FORK_UPSTREAM_UPDATES: "1" } : {}) }, platform: "darwin", on() {} },
 		__dirname: path.dirname(mainFile), URL, AbortController,
 		setInterval: (callback: () => void, delay: number) => intervals.push({ callback, delay }),
 		setTimeout() {},
@@ -113,7 +116,7 @@ function fixture({ packaged = true, updaterMissing = false } = {}) {
 	runInContext(mainSource, context, { filename: mainFile });
 	const run = (code: string) => runInContext(code, context);
 	return {
-		run, updater, windows, intervals, handles, settingsReads, order, app,
+		run, updater, windows, intervals, handles, listeners, settingsReads, order, app,
 		setSettings: (value: unknown) => { settings = JSON.stringify(value); },
 		setSettingsFailure: (value: string | Error) => { settings = value; },
 		setEnumerationFailure: (value: boolean) => { enumerationFails = value; },
@@ -121,6 +124,7 @@ function fixture({ packaged = true, updaterMissing = false } = {}) {
 		state: () => JSON.parse(JSON.stringify(run("updateState"))),
 		check: async (manual = false) => { run(`checkForUpdates({ manual: ${manual} })`); await Promise.resolve(); await Promise.resolve(); },
 		menuCheck: () => menu[0]!.submenu!.find(item => item.label === "Check for Updates…")!.click!(),
+		menuLabels: () => menu[0]!.submenu!.map(item => item.label),
 	};
 }
 
@@ -274,6 +278,33 @@ describe("startup, timer, trusted IPC and menu wiring", () => {
 		assert.equal(f.updater.checks, 1);
 	});
 
+	it("restart-to-install IPC accepts only a live owned main frame at the exact app origin", async () => {
+		const f = fixture(); await f.run("main()");
+		const win = f.windows[0]!;
+		const sender = win.webContents;
+		const install = f.listeners.get("lh:update-install")!;
+		const foreign = f.window().webContents; // Same URL, but not registered by createWindow.
+		f.run("serverProcess = fixtureChild");
+		for (const bad of [
+			{ sender: {}, senderFrame: sender.mainFrame },
+			{ sender, senderFrame: { url: sender.mainFrame.url } },
+			{ sender, senderFrame: undefined },
+			{ sender: foreign, senderFrame: foreign.mainFrame },
+		]) install(bad);
+		const ownUrl = sender.mainFrame.url;
+		for (const url of ["https://untrusted.invalid/", "http://127.0.0.1:9001/", "not a URL"]) {
+			sender.mainFrame.url = url; // Navigation changes the current frame's URL, not its identity.
+			install({ sender, senderFrame: sender.mainFrame });
+		}
+		assert.deepEqual(f.order, [], "untrusted requests neither kill the server nor reach quit-and-install");
+		sender.mainFrame.url = ownUrl;
+		install({ sender, senderFrame: sender.mainFrame });
+		assert.deepEqual(f.order, ["SIGTERM", "install"], "legitimate Restart still stops the server before installation");
+		win.emit("closed");
+		install({ sender, senderFrame: sender.mainFrame });
+		assert.deepEqual(f.order, ["SIGTERM", "install"], "closing the window revokes its membership");
+	});
+
 	it("menu restores/focuses a minimized window, opens General, and manually checks while OFF", async () => {
 		const f = fixture(); f.setSettings({ general: { autoUpdate: false } }); await f.run("main()");
 		const win = f.windows[0]!; win.webContents.loading = false; win.minimized = true;
@@ -299,5 +330,21 @@ describe("startup, timer, trusted IPC and menu wiring", () => {
 		const f = fixture(); f.setSettings({ general: { autoUpdate: false } }); await f.run("main()");
 		f.windows[0]!.webContents.fails = true; f.windows[0]!.webContents.loading = false;
 		f.menuCheck(); assert.equal(f.updater.checks, 1);
+	});
+});
+
+describe("mobile fork", () => {
+	it("upstream auto-update is off by default: no check, status disabled, no settings read", async () => {
+		const f = fixture({ forkUpdates: false });
+		f.run("setupAutoUpdater()"); await f.check(true); await f.check();
+		assert.equal(f.updater.checks, 0);
+		assert.equal(f.settingsReads.length, 0);
+		assert.equal(f.state().status, "disabled");
+	});
+
+	it("the app menu has Phone Access", () => {
+		const f = fixture();
+		f.run("installMenu()");
+		assert(f.menuLabels().includes("Phone Access…"));
 	});
 });

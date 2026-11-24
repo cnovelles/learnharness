@@ -66,9 +66,9 @@ import {
 	SearchIcon,
 	XIcon,
 } from "lucide-react";
-import { chainsForSelection, chainSourceDirectory, folderEntryCheck, toggleSourceEntries, formatChainLine, fuzzyScore, sourceFileLabel } from "@/src/core";
-import type { GraphChain, GraphNode, SourceDirectory, SourceEntry, SourceFolder, SourceEntrySelection } from "@/src/core";
-import { EditableSourceName, SourceDragRow, sourceNameMatches, SourceFolderTree, type OrganizationChange } from "./source-folder-tree";
+import { chainsForSelection, chainSourceDirectory, chainSourceLabel, chainsOutsideSources, folderEntryCheck, groupChainsBySource, isChainSearch, isSourceOpen, nextChainSort, practiceSourceIds, searchChains, sourceDisplayName, sourceNameMatches, sourceNodeMembership, toggleSourceEntries, formatChainLine, DEFAULT_CHAIN_SORT } from "@/src/core";
+import type { ChainSort, ChainSortCol, GraphChain, GraphNode, SourceDirectory, SourceEntry, SourceFolder, SourceEntrySelection } from "@/src/core";
+import { EditableSourceName, SourceDragRow, SourceFolderTree, type OrganizationChange } from "./source-folder-tree";
 import { chainRow, useChainNavigation } from "./chain-navigation";
 import { useServerEvent, useServerResync } from "./server-events";
 import { TopBar } from "@/components/top-bar";
@@ -78,25 +78,9 @@ import { LatexGlyph } from "@/components/latex-glyph";
 import { ToolContentResponse } from "@/components/ai-elements/message";
 import { TreeCell, TreeCheckbox, TreeDisclosure, TreeGuide, TreeHeader, TreeSelectionSpacer, TreeSeparator, treeBranchLayout, treeColumnLayout, treeRowLayout } from "./tree-presentation";
 
-/** The sortable columns (owner ruling: all three — consistency). */
-export type ChainSortCol = "name" | "props" | "created";
-export interface ChainSort {
-	col: ChainSortCol;
-	/** 1 = ascending (A→Z, oldest-first, smallest-first), -1 = descending. */
-	dir: 1 | -1;
-}
-
-/** A cluster's chains share the conclusion's birth (owner ruling). This
- *  record is assembled per render from the visible chains. */
-interface ClusterGroup {
-	key: string;
-	birth: string | null;
-	label: string | null;
-	kind: "chat" | "notes" | null;
-	chains: ReturnType<typeof chainsForSelection>;
-	nodeIds: string[];
-	newestCreatedAt: string;
-}
+/** The sort types and the source groups live in core (src/core/chain-rows.ts;
+ *  the phone shares them). */
+export type { ChainSort, ChainSortCol } from "@/src/core";
 
 /** The table's pure body — exported for SSR pins (the render-suite
  *  discipline). All state (query, sort, selection, expansion) arrives
@@ -185,116 +169,24 @@ export function ChainTableBody({
 	};
 	const byId = useMemo(() => new Map(nodes.map((n) => [n.id, n])), [nodes]);
 	const directory = useMemo(() => fullDirectory && chainSourceDirectory(fullDirectory), [fullDirectory]);
-	const hiddenSourceIds = useMemo(() => new Set(fullDirectory?.sources.filter((s) => s.chatKind === "practice").map((s) => s.id)), [fullDirectory]);
+	const hiddenSourceIds = useMemo(() => practiceSourceIds(fullDirectory), [fullDirectory]);
 	const sourceRecords = useMemo(() => new Map(directory?.sources.map((s) => [s.id, s])), [directory]);
 	const matchesSource = useCallback((birth: string) => sourceNameMatches(directory, birth,
-		sourceRecords.get(birth)?.label ?? sessions[birth] ?? (fileSources[birth] === undefined ? null : sourceFileLabel(fileSources[birth])), query),
+		chainSourceLabel(birth, sourceRecords, sessions, fileSources), query),
 	[directory, sourceRecords, sessions, fileSources, query]);
 	const chains = useMemo(() => chainsForSelection(nodes, storedChains), [nodes, storedChains]);
 	// Filter source groups, not global nodes: shared premises remain visible
 	// in teaching/notes groups. Keep the graph-wide header and pick set intact.
-	const sourceChains = useMemo(() => chains.filter((chain) =>
-		!hiddenSourceIds.has(byId.get(chain.conclusion)?.provenance[0]?.chatId ?? "")), [chains, byId, hiddenSourceIds]);
-	const searching = query.trim() !== "";
-	const allSourceNodes = useMemo(() => {
-		const membership = new Map<string, Set<string>>();
-		for (const chain of sourceChains) {
-			const birth = byId.get(chain.conclusion)?.provenance[0]?.chatId;
-			if (!birth) continue;
-			const members = membership.get(birth) ?? new Set<string>();
-			for (const id of [...chain.premises, chain.conclusion]) members.add(id);
-			membership.set(birth, members);
-		}
-		return membership;
-	}, [sourceChains, byId]);
+	const sourceChains = useMemo(() => chainsOutsideSources(chains, byId, hiddenSourceIds), [chains, byId, hiddenSourceIds]);
+	const searching = isChainSearch(query);
+	const allSourceNodes = useMemo(() => sourceNodeMembership(sourceChains, byId), [sourceChains, byId]);
 
-	// The fuzzy filter: a chain is visible when ANY member matches on
-	// name, aliases, or statement; chains rank by best member score.
-	const visibleChains = useMemo(() => {
-		if (!searching) return sourceChains;
-		const scored = sourceChains
-			.map((chain) => {
-				const birth = byId.get(chain.conclusion)?.provenance[0]?.chatId;
-				let best: number | null = birth && matchesSource(birth) ? 0 : null;
-				for (const id of [...chain.premises, chain.conclusion]) {
-					const node = byId.get(id);
-					if (!node) continue;
-					const s = fuzzyScore(query, node.name, node.statement, ...node.aliases);
-					if (s === null) continue;
-					if (best === null || s > best) best = s;
-				}
-				return best === null ? null : { chain, best };
-			})
-			.filter((r): r is { chain: (typeof chains)[number]; best: number } => r !== null);
-		return scored
-			.sort((a, b) => b.best - a.best || (a.chain.id < b.chain.id ? -1 : 1))
-			.map(({ chain }) => chain);
-	}, [sourceChains, byId, query, searching, matchesSource]);
-
-	// Group the visible chains by their CONCLUSION's birth (owner ruling).
-	// Unlabeled births (provenance gone / never named) form one honest
-	// muted group, sorted last under name-sort.
-	const groups = useMemo(() => {
-		// Session kinds must arrive before provenance-only source rows can render.
-		if (sourceInventoryPending) return [];
-		const map = new Map<string, ClusterGroup>();
-		for (const source of directory?.sources ?? []) {
-			if (searching && !matchesSource(source.id)) continue;
-			map.set(source.id, { key: source.id, birth: source.id, label: source.label,
-				kind: source.kind === "missing" ? null : source.kind, chains: [], nodeIds: [], newestCreatedAt: "" });
-		}
-		for (const chain of visibleChains) {
-			const conclusion = byId.get(chain.conclusion);
-			const birth = conclusion?.provenance[0]?.chatId ?? null;
-			const key = birth ?? "\0unlabeled";
-			let group = map.get(key);
-			if (!group) {
-				const label = birth === null ? null : (sourceRecords.get(birth)?.label ?? sessions[birth] ?? (fileSources[birth] === undefined ? null : sourceFileLabel(fileSources[birth])));
-				const kind =
-					birth === null ? null : sessions[birth] !== undefined ? "chat" : fileSources[birth] !== undefined ? "notes" : null;
-				group = { key, birth, label, kind, chains: [], nodeIds: [], newestCreatedAt: "" };
-				map.set(key, group);
-			}
-			group.chains.push(chain);
-			for (const id of [...chain.premises, chain.conclusion]) {
-				if (!group.nodeIds.includes(id)) group.nodeIds.push(id);
-				const createdAt = byId.get(id)?.createdAt ?? "";
-				if (createdAt > group.newestCreatedAt) group.newestCreatedAt = createdAt;
-			}
-		}
-		const collator = new Intl.Collator(undefined, { sensitivity: "base", numeric: true });
-		const list = [...map.values()];
-		// Existing graph groups retain their newest-member date. Inventory-only
-		// rows fall back to record dates; a re-import must not redraft old dates.
-		for (const group of list) if (!group.newestCreatedAt && group.birth) group.newestCreatedAt = sourceRecords.get(group.birth)?.createdAt ?? "";
-		// Sort law (owner ruling: all three columns sortable — consistency):
-		// the active column orders BOTH cluster rows and chains within; name
-		// is the universal tiebreak (asc). Unlabeled clusters sort last under
-		// name-sort (￿ sentinel).
-		const nameKey = (g: ClusterGroup) => g.label ?? "\uffff";
-		const cmpName = (a: ClusterGroup, b: ClusterGroup) => collator.compare(nameKey(a), nameKey(b)) * (sort.col === "name" ? sort.dir : 1);
-		const cmpProps = (a: ClusterGroup, b: ClusterGroup) =>
-			sort.dir === -1 ? b.nodeIds.length - a.nodeIds.length : a.nodeIds.length - b.nodeIds.length;
-		const cmpCreated = (a: ClusterGroup, b: ClusterGroup) =>
-			sort.dir === -1 ? b.newestCreatedAt.localeCompare(a.newestCreatedAt) : a.newestCreatedAt.localeCompare(b.newestCreatedAt);
-		list.sort((a, b) =>
-			sort.col === "created" ? cmpCreated(a, b) || cmpName(a, b) : sort.col === "props" ? cmpProps(a, b) || cmpName(a, b) : cmpName(a, b),
-		);
-		for (const group of list) {
-			const chainName = (chain: (typeof chains)[number]) => byId.get(chain.conclusion)?.name ?? chain.conclusion;
-			const chainSize = (chain: (typeof chains)[number]) => chain.premises.length + 1;
-			const chainDate = (chain: (typeof chains)[number]) => byId.get(chain.conclusion)?.createdAt ?? "";
-			const cName = (a: (typeof chains)[number], b: (typeof chains)[number]) => collator.compare(chainName(a), chainName(b)) * (sort.col === "name" ? sort.dir : 1);
-			const cProps = (a: (typeof chains)[number], b: (typeof chains)[number]) =>
-				sort.dir === -1 ? chainSize(b) - chainSize(a) : chainSize(a) - chainSize(b);
-			const cDate = (a: (typeof chains)[number], b: (typeof chains)[number]) =>
-				sort.dir === -1 ? chainDate(b).localeCompare(chainDate(a)) : chainDate(a).localeCompare(chainDate(b));
-			group.chains.sort((a, b) =>
-				sort.col === "created" ? cDate(a, b) || cName(a, b) : sort.col === "props" ? cProps(a, b) || cName(a, b) : cName(a, b),
-			);
-		}
-		return list;
-	}, [visibleChains, byId, sessions, fileSources, sort, directory, sourceRecords, searching, matchesSource, sourceInventoryPending]);
+	// The fuzzy filter, the source grouping and the sort law live in
+	// src/core/chain-rows.ts (the phone shows the same rows).
+	const visibleChains = useMemo(() => searchChains(sourceChains, byId, query, matchesSource), [sourceChains, byId, query, matchesSource]);
+	const groups = useMemo(() => groupChainsBySource({ visibleChains, byId, sessions, fileSources, sort, directory, sourceRecords, searching,
+		matchesSource, sourceInventoryPending }),
+	[visibleChains, byId, sessions, fileSources, sort, directory, sourceRecords, searching, matchesSource, sourceInventoryPending]);
 
 	// The derived shape under the floating bar (the agents' ACTUAL input).
 	const derived = useMemo(() => {
@@ -404,7 +296,7 @@ export function ChainTableBody({
 					expanded={expandedClusters} collapsedForSearch={foldedClusters} onToggleExpanded={toggleCluster} selection={selection} selectedFolders={selectedFolders}
 					onToggleNodes={onToggleNodes} onToggleFolder={onToggleFolder} allowEmptySelection={!selectMode} allSourceNodes={allSourceNodes}
 					renderSource={(group, depth) => {
-					const open = searching ? !foldedClusters.has(group.key) : expandedClusters.has(group.key);
+					const open = isSourceOpen(group.key, { searching, expanded: expandedClusters, foldedForSearch: foldedClusters });
 					const selectedCount = group.nodeIds.filter((id) => selection.has(id)).length;
 					const empty = group.birth === null ? group.nodeIds.length === 0 : !allSourceNodes.get(group.birth)?.size;
 					return (
@@ -427,23 +319,23 @@ export function ChainTableBody({
 								<TreeGuide selectionColumn depth={0} data-testid={`cluster-thread-${group.key}`} />
 							)}
 							{/* The cluster row: birth-session group header. */}
-							<SourceDragRow {...chainRow(["source", group.key], depth, open)} kind="source" id={group.key} name={group.label ?? "unlabeled"} enabled={Boolean(onOrganizationChange && group.birth)} {...treeRowLayout()}>
+							<SourceDragRow {...chainRow(["source", group.key], depth, open)} kind="source" id={group.key} name={sourceDisplayName(group.label)} enabled={Boolean(onOrganizationChange && group.birth)} {...treeRowLayout()}>
 								<RowCheckbox
 									disabled={selectMode ? group.nodeIds.length === 0 : !directory?.sources.some((s) => s.id === group.birth)}
 									checked={selectMode ? selectedCount === group.nodeIds.length && group.nodeIds.length > 0 : group.birth !== null && selectedSources.has(group.birth)}
 									indeterminate={selectMode ? selectedCount > 0 && selectedCount < group.nodeIds.length : false}
 									onToggle={(next) => { if (selectMode) onToggleNodes(group.nodeIds, next); else if (group.birth) onToggleSource(group.birth, next); }}
 									testid={`cluster-checkbox-${group.key}`}
-									label={selectMode ? `Select everything born in ${group.label ?? "unlabeled"}` : `Select source ${group.label ?? "unlabeled"}`}
+									label={selectMode ? `Select everything born in ${sourceDisplayName(group.label)}` : `Select source ${sourceDisplayName(group.label)}`}
 								/>
-								<Expander open={open} onClick={() => toggleCluster(group.key)} testid={`cluster-toggle-${group.key}`} label={`Expand cluster ${group.label ?? "unlabeled"}`} />
-								<button type="button" data-source-icon data-testid={`source-icon-${group.key}`} aria-expanded={open} aria-label={`Expand source ${group.label ?? "unlabeled"}`}
+								<Expander open={open} onClick={() => toggleCluster(group.key)} testid={`cluster-toggle-${group.key}`} label={`Expand cluster ${sourceDisplayName(group.label)}`} />
+								<button type="button" data-source-icon data-testid={`source-icon-${group.key}`} aria-expanded={open} aria-label={`Expand source ${sourceDisplayName(group.label)}`}
 									onClick={() => toggleCluster(group.key)} className={`flex h-5 w-3.5 shrink-0 items-center justify-center rounded ${empty ? "text-muted-foreground/60" : "text-muted-foreground"} transition-colors hover:bg-accent hover:text-foreground`}>
 									{open ? <BookOpenIcon className="size-3.5 shrink-0" /> : <BookIcon className="size-3.5 shrink-0" />}
 								</button>
 								{onOrganizationChange && group.birth && group.kind !== null
 									? <EditableSourceName name={group.label ?? ""} muted={empty} onSave={(name) => onOrganizationChange({ action: "rename-source", id: group.birth!, name })} />
-									: <span className={`min-w-0 flex-1 truncate text-sm font-medium${empty ? " text-muted-foreground/60" : ""}`}>{group.label ?? <span className="text-muted-foreground/60">unlabeled</span>}</span>}
+									: <span className={`min-w-0 flex-1 truncate text-sm font-medium${empty ? " text-muted-foreground/60" : ""}`}>{group.label ?? <span className="text-muted-foreground/60">{sourceDisplayName(null)}</span>}</span>}
 								{group.kind === "notes" && <span className="text-[11px] uppercase tracking-widest text-muted-foreground/60">notes</span>}
 								<TreeCell widthClassName="w-14" align="right" className="text-xs tabular-nums text-muted-foreground">
 									{group.nodeIds.length}
@@ -702,7 +594,7 @@ export function ChainTableOverlay({
 	onSelectionChange?: (next: ReadonlySet<string>) => void;
 }) {
 	const [query, setQuery] = useState("");
-	const [sort, setSort] = useState<ChainSort>({ col: "name", dir: 1 });
+	const [sort, setSort] = useState<ChainSort>(DEFAULT_CHAIN_SORT);
 	const [internalSelection, setInternalSelection] = useState<ReadonlySet<string>>(() => new Set());
 	const [expandedClusters, setExpandedClusters] = useState<ReadonlySet<string>>(() => new Set());
 	const [expandedChains, setExpandedChains] = useState<ReadonlySet<string>>(() => new Set());
@@ -838,13 +730,7 @@ export function ChainTableOverlay({
 					query={query}
 					onQuery={setQuery}
 					sort={sort}
-					onSort={(col) =>
-						setSort((prev) =>
-							prev.col === col
-								? { col, dir: prev.dir === 1 ? -1 : 1 }
-								: { col, dir: col === "name" ? 1 : -1 },
-						)
-					}
+					onSort={(col) => setSort((prev) => nextChainSort(prev, col))}
 					selection={selection}
 					expandedClusters={expandedClusters}
 					expandedChains={expandedChains}

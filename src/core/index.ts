@@ -21,7 +21,16 @@ export * from "./ports.ts";
 export * from "./chains.ts";
 export * from "./source-organization.ts";
 export * from "./source-selection.ts";
+export * from "./session-folders.ts";
 export * from "./source-label.ts";
+// Issue 08 (mobile fork): the chain-table rows and the usage format helpers.
+// Both are pure and node-free; the phone app imports the files directly.
+export * from "./chain-rows.ts";
+export * from "./usage-format.ts";
+export * from "./graph-view-model.ts";
+export * from "./graph-cost-format.ts";
+export * from "./graph-canvas-geometry.ts";
+export * from "./folder-order.ts";
 export * from "./render-settings.ts";
 
 export * from "./question-core.ts";
@@ -60,6 +69,7 @@ export * from "./tool-parts.ts";
 export * from "./answer-presentation.ts";
 export * from "./prices.ts";
 export * from "./context-usage.ts";
+export * from "./session-stats.ts";
 export type { ChatGPTStatus, ChatGPTControlBridge } from "./contracts/chatgpt.ts";
 export { NATIVE_SUBSCRIPTIONS } from "./contracts/subscriptions.ts";
 export type { NativeSubscriptionProviderId, NativeSubscriptionLogicalId, NativeSubscriptionStatus, NativeSubscriptionSnapshot, NativeSubscriptionScope, NativeSubscriptionControlBridge, SubscriptionInteraction, SubscriptionPrompt } from "./contracts/subscriptions.ts";

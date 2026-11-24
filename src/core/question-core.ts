@@ -21,6 +21,7 @@ import { Type, type Static } from "typebox";
 import { stripModelValueDebris } from "./value-debris.ts";
 import { expandCitationsForModel } from "./citations.ts";
 import type { PluginSubmissionImages } from "./plugin-submissions.ts";
+import { toolQuestionKind } from "./pending.ts";
 
 // ─── shared types ───────────────────────────────────────────────────────────
 
@@ -159,8 +160,7 @@ export function quizInputProblems(input: {
 // (All consumers read by key; the order is authoring guidance, nothing else.)
 export const quizInputBase = Type.Object({
 	question: Type.String({
-		description:
-			"The single quiz question to ask. ONE question per turn: ask, then end your turn — the answer determines the next question.",
+		description: "The single quiz question to ask.",
 	}),
 	options: Type.Array(Type.Object(quizOptionProps), {
 		minItems: 2,
@@ -244,9 +244,8 @@ export function questionNeedsReveal(tool: string, rawInput: unknown, phase: stri
 const predictCheckType = Type.Union([Type.Literal("predict"), Type.Literal("check")], {
 	description:
 		"REQUIRED — the question's role in the teaching cycle, as a bare word (no quotes): predict = posed BEFORE " +
-		"you teach the step (its own turn; the learner answers, then your teaching resolves it — arrives open, never " +
-		"collapsed); check = posed AFTER the step's teaching is complete (arrives collapsed behind the Check your " +
-		"understanding reveal). ONE question per turn either way.",
+		"you teach the step (arrives open, never collapsed); check = posed AFTER the step's teaching is complete " +
+		"(arrives collapsed behind the Check your understanding reveal)."
 });
 
 
@@ -304,8 +303,7 @@ export const quizDisplayInputSchema = Type.Object({
 
 export const explainInputBase = Type.Object({
 	question: Type.String({
-		description:
-			"The single question to ask. ONE question per turn: ask, then end your turn — the answer determines the next.",
+		description: "The single question to ask.",
 	}),
 	correctAnswer: Type.String({
 		description:
@@ -371,8 +369,7 @@ export const askInputSchema = Type.Object({
 	// whether options are present (the dock does exactly this). One less
 	// knob for the model to misuse.
 	question: Type.String({
-		description:
-			"The single question to ask the learner. ONE question per turn: ask, then end your turn — the answer determines the next question.",
+		description: "The single question to ask the learner.",
 	}),
 	details: Type.Optional(
 		Type.String({ description: "Optional extra context or instructions shown under the question." }),
@@ -410,6 +407,9 @@ export type QuestionKind = "quiz" | "ask" | "explain";
 export type SelectMode = "single-select" | "multi-select";
 export type QuestionMode = SelectMode | "text";
 
+/** Displayed letter → one-based position in the authored options array. */
+export type OptionOrder = Record<string, number>;
+
 /** Full question data — stored in the `lh_question` custom entry. */
 export interface QuestionData {
 	id: string;
@@ -423,6 +423,7 @@ export interface QuestionData {
 	context?: string;
 	mode: QuestionMode;
 	options: QuizOption[]; // display order (post-shuffle)
+	optionOrder?: OptionOrder;
 	// quiz only. NEVER send to the client before answering:
 	correctIndices?: number[];
 	// explain only. NEVER send to the client before answering:
@@ -449,6 +450,7 @@ export interface QuestionAnswerData {
 	questionType?: QuizQuestionType;
 	questionText: string;
 	options?: { index: number; label: string }[]; // snapshot for rendering
+	optionOrder?: OptionOrder; // snapshot; absent on older or unlettered answers
 	dontKnow: boolean;
 	answers: OptionAnswer[];
 	other?: string; // ask: "Other" free text
@@ -559,9 +561,13 @@ export function toggleOther(mode: SelectMode, sel: DockSelection): DockSelection
 
 // ─── options ────────────────────────────────────────────────────────────────
 
-export function normalizeOptions(
-	options: string | Array<{ label: string; value?: string; description?: string }> | undefined,
-): QuizOption[] {
+type RawOptions = string | Array<{ label: string; value?: string; description?: string }> | undefined;
+
+export function normalizeOptions(options: RawOptions): QuizOption[] {
+	return normalizeWithPositions(options).map(({ option }) => option);
+}
+
+function normalizeWithPositions(options: RawOptions): { option: QuizOption; position: number }[] {
 	const seen = new Set<string>();
 	// The persisted tool call can carry GLM's string-encoded options —
 	// parseOptionsIfString is the same coercion the server's
@@ -571,12 +577,15 @@ export function normalizeOptions(
 		? (coerced as Array<{ label: string; value?: string; description?: string }>)
 		: [];
 	return list
-		.map((option) => ({
-			label: option.label.trim(),
-			value: option.value?.trim() || option.label.trim(),
-			description: option.description?.trim() || undefined,
+		.map((option, i) => ({
+			position: i + 1,
+			option: {
+				label: option.label.trim(),
+				value: option.value?.trim() || option.label.trim(),
+				description: option.description?.trim() || undefined,
+			},
 		}))
-		.filter((option) => {
+		.filter(({ option }) => {
 			if (option.label.length === 0) return false;
 			if (seen.has(option.value)) throw new Error(`duplicate option value "${option.value}"`);
 			seen.add(option.value);
@@ -621,6 +630,32 @@ export function shuffleOptions(options: QuizOption[], rand: () => number = Math.
 		out[j] = a;
 	}
 	return out;
+}
+
+const OPTION_LETTERS = "ABCDEFGHIJKLMNOPQRSTUVWXYZ";
+
+/** Shared by the pending dock and the open side-chat snapshot. Only
+ *  quizzes shuffle; keep the shuffle seed and grading keys unchanged. */
+export function questionDisplayOptions(raw: RawOptions, kind: QuestionKind, multi: boolean, toolCallId: string): {
+	options: QuizOption[]; optionOrder?: OptionOrder;
+} {
+	const authored = normalizeWithPositions(raw);
+	const options = authored.map(({ option }) => option);
+	const displayed = kind === "quiz" ? shuffleOptions(options, seededRandom(toolCallId)) : options;
+	if (kind === "explain" || multi || displayed.length === 0 || displayed.length > OPTION_LETTERS.length) return { options: displayed };
+	const positions = new Map(authored.map(({ option, position }) => [option, position]));
+	const optionOrder = Object.fromEntries(displayed.map((option, i) => [OPTION_LETTERS[i]!, positions.get(option)!]));
+	return { options: displayed, optionOrder };
+}
+
+export function optionLetterAt(displayIndex: number): string | undefined {
+	return OPTION_LETTERS[displayIndex - 1];
+}
+
+/** Resolve a letter from a mapping. Compact results only use the saved map. */
+export function displayedOptionLetter(order: OptionOrder | undefined, displayIndex: number): string | undefined {
+	const letter = optionLetterAt(displayIndex);
+	return letter && order && Object.hasOwn(order, letter) ? letter : undefined;
 }
 
 // ─── quiz grading ───────────────────────────────────────────────────────────
@@ -706,6 +741,66 @@ function formatOptionRef(options: QuizOption[], index: number): string {
 }
 
 /**
+ * Canonical QuestionData for one pending question call (mobile fork: moved
+ * here from components/question-dock.tsx so the phone dock shares it).
+ * Quiz options are deterministically shuffled (seeded by toolCallId) so
+ * position never leaks correctness and every client renders the same order;
+ * the display order is snapshotted into the answer record at submit time.
+ */
+export function questionDataForCall(toolName: string, toolCallId: string, input: unknown, onError: (message: string) => void = () => {}): QuestionData {
+	const kind = toolQuestionKind(toolName);
+	const anyInput = (input ?? {}) as { question: string; details?: string; multiSelect?: unknown; type?: unknown };
+	const quizInput = kind === "quiz" ? (input as QuizToolInput) : null;
+	const askInput = kind === "ask" ? (input as AskToolInput) : null;
+	const explainInput = kind === "explain" ? (input as ExplainToolInput) : null;
+	const multi = input instanceof Object && "multiSelect" in input ? anyInput.multiSelect === true : false;
+	const mode: QuestionMode =
+		kind === "quiz"
+			? multi
+				? "multi-select"
+				: "single-select"
+			: askInput?.options?.length
+				? multi
+					? "multi-select"
+					: "single-select"
+				: "text";
+	// Upstream v0.7.0 (question-dock.tsx): the display order and the letter
+	// map come from questionDisplayOptions.
+	const { options: ordered, optionOrder } = questionDisplayOptions(
+		(quizInput?.options ?? askInput?.options) as RawOptions,
+		kind,
+		multi,
+		toolCallId,
+	);
+	const q: QuestionData = {
+		id: toolCallId,
+		kind,
+		// The role (owner 2026-10-03): predict questions gate by it in the
+		// view (never collapsed) and the answered card tucks the explanation.
+		questionType: kind === "quiz" ? normalizeQuizType(anyInput.type) : undefined,
+		question: anyInput.question,
+		context: anyInput.details,
+		mode,
+		options: ordered,
+		optionOrder,
+		createdAt: new Date().toISOString(),
+	};
+	if (quizInput) {
+		const resolved = resolveCorrect(quizInput.correctAnswer, ordered);
+		if (resolved.error) onError(`[quiz] correctAnswer did not resolve: ${resolved.error}`);
+		q.correctIndices = resolved.indices;
+		q.explanation = quizInput.explanation;
+	}
+	if (explainInput) {
+		// The commitment rides the question data (never sent to the client
+		// before answering) and snapshots into the answer at submit. One
+		// field, reasoning included (owner ruling 2026-09-27).
+		q.committedAnswer = explainInput.correctAnswer;
+	}
+	return q;
+}
+
+/**
  * Turn an AnswerRequest into the full answer record + the user message the
  * agent will see. Quiz answers are graded here; ask answers are not.
  */
@@ -716,6 +811,7 @@ export function buildAnswer(qd: QuestionData, req: AnswerRequest, tool?: string)
 		questionType: qd.questionType,
 		questionText: qd.question,
 		options: qd.options.map((o, i) => ({ index: i + 1, label: o.label })),
+		...(qd.optionOrder ? { optionOrder: qd.optionOrder } : {}),
 		dontKnow: req.dontKnow === true,
 		answers: [],
 		thinking: req.thinking?.trim() || undefined,
@@ -786,8 +882,12 @@ export function compactAnswerForModel(ad: QuestionAnswerData): Record<string, un
 	if (ad.dontKnow) out.dontKnow = true;
 	// Array.isArray: the seam is called with `unknown` answers (test
 	// fixtures, foreign records) — degrade to omission, never crash.
+	if (ad.optionOrder) out.optionOrder = ad.optionOrder;
 	if (Array.isArray(ad.answers) && ad.answers.length > 0)
-		out.answers = ad.answers.map((a) => ({ index: a.index, label: a.label }));
+		out.answers = ad.answers.map((a) => {
+			const letter = displayedOptionLetter(ad.optionOrder, a.index);
+			return { index: a.index, label: a.label, ...(letter ? { letter } : {}) };
+		});
 	if (ad.text) out.text = expandCitationsForModel(ad.text);
 	if (ad.other) out.other = expandCitationsForModel(ad.other);
 	// The verdict + stated confidence are the learner's PERFORMANCE — new
