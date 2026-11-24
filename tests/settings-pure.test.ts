@@ -49,11 +49,13 @@ describe("resolveAppearance — delta over factory", () => {
 });
 
 describe("appearanceVars — the mapping the provider applies", () => {
-	it("factory appearance on Default: the Default palette plus the type tokens", () => {
+	it("factory appearance on Default (OrbiTutor): its palette plus the type tokens", () => {
 		const vars = appearanceVars(resolveAppearance(undefined), DEFAULT_THEME);
 		assert.equal(vars["--background"], "#141414");
 		assert.equal(vars["--accent"], "#2a2a2a", "the hover surface keeps its hand-picked value");
-		assert.equal(vars["--lh-ink-strong"], "#e6e6e6", "emphasis = text on Default");
+		assert.equal(vars["--lh-ink-strong"], "#f2f2f2", "OrbiTutor bold ink");
+		assert.equal(vars["--primary"], "#2fd08a", "OrbiTutor buttons: the logo green");
+		assert.equal(vars["--primary-foreground"], "#0b2117");
 		assert.equal(vars["--lh-prose-size"], "16px");
 		assert.equal(vars["--lh-heading-weight"], "900");
 		assert.equal(vars["--font-prose"], undefined, "no font override at factory");

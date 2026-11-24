@@ -35,7 +35,8 @@
    Dark is the default variant (:root) and the `.dark` class on <html>.
    THEMES (theme wave, 2026-11-04): the active theme's colors land as
    inline variables on <html> (app/layout.tsx first paint, then the
-   appearance provider), so these literals are the Default theme's —
+   appearance provider), so these literals are the default theme's
+   (OrbiTutor since issue 22) —
    themeVars(DEFAULT_THEME) in src/core/themes.ts; tests/themes.test.ts
    pins the two equal. */
 :root,
@@ -48,32 +49,32 @@
 	--card-foreground: #e6e6e6;
 	--popover: #1c1c1c;
 	--popover-foreground: #e6e6e6;
-	--primary: #e6e6e6;
-	--primary-foreground: #141414;
+	--primary: #2fd08a;
+	--primary-foreground: #0b2117;
 	--secondary: #1c1c1c;
 	--secondary-foreground: #e6e6e6;
 	--muted: #1c1c1c;
-	--muted-foreground: #8d8d8d;
+	--muted-foreground: #9a9a9a;
 	--accent: #2a2a2a;
 	--accent-foreground: #e6e6e6;
-	--destructive: #ef4444;
-	--border: #434343;
-	--input: #434343;
-	--ring: #8d8d8d;
+	--destructive: #f26b6b;
+	--border: #3a3a3a;
+	--input: #3a3a3a;
+	--ring: #38d892;
 	/* The theme accent (rings, toggles, the selected theme card). The
 	   shadcn --accent above is the HOVER surface, not this. */
-	--lh-accent: #8d8d8d;
+	--lh-accent: #38d892;
 	/* The strong line ink: plan-map outlines, callout borders, the LH mark. */
 	--lh-line-strong: #e6e6e6;
 	/* Emphasis inks default to the REGULAR TEXT COLOR (owner ruling,
 	   appearance wave 2026-09-26); themes give them their own colors. */
-	--lh-ink-strong: #e6e6e6;
-	--lh-ink-italic: #e6e6e6;
-	--lh-ink-code: #e6e6e6;
+	--lh-ink-strong: #f2f2f2;
+	--lh-ink-italic: #8fe3bb;
+	--lh-ink-code: #f0a37f;
 	/* Status inks (text-error, bg-success/15, border-warning/40, …). */
-	--lh-error: #ef4444;
-	--lh-success: #22c55e;
-	--lh-warning: #f59e0b;
+	--lh-error: #f26b6b;
+	--lh-success: #38d892;
+	--lh-warning: #f2b544;
 	/* THE READING SIZE = the ladder's 16px rung (--text-lg). Can't be
 	   var()-linked: @theme inline inlines literals into utilities without
 	   emitting runtime vars — so this is the one documented duplication:

@@ -64,11 +64,12 @@ describe("presets", () => {
 			assert.ok(sanitizeThemeFile(t), t.id);
 			assert.ok(!ids.has(t.id), `duplicate ${t.id}`);
 			ids.add(t.id);
-			assert.equal(t.id, themeIdFromName(t.name));
+			// The default keeps the id "default" under its new name (issue 22).
+			assert.equal(t.id, t.id === "default" ? "default" : themeIdFromName(t.name));
 			assert.equal(t.builtin, true);
 		}
 		assert.deepEqual([...ids], [
-			"default", "catppuccin-latte", "catppuccin-frappe", "catppuccin-macchiato", "catppuccin-mocha",
+			"default", "orbitutor-light", "classic", "catppuccin-latte", "catppuccin-frappe", "catppuccin-macchiato", "catppuccin-mocha",
 			"rose-pine", "rose-pine-dawn", "gruvbox-dark", "ivory", "pastel", "nvchad-onedark",
 		]);
 	});
@@ -95,7 +96,7 @@ describe("themeVars — the adapter", () => {
 	it("Default reproduces app/globals.css's literals exactly", () => {
 		const css = fs.readFileSync(new URL("../app/globals.css", import.meta.url), "utf8");
 		const block = cssBlock(css, ":root,\n.dark");
-		for (const [token, value] of Object.entries(themeVars(DEFAULT_THEME.colors, "dark"))) {
+		for (const [token, value] of Object.entries(themeVars(DEFAULT_THEME.colors, "dark", DEFAULT_THEME.buttons))) {
 			assert.equal(block.get(token), value, token);
 		}
 	});
@@ -118,6 +119,61 @@ describe("themeVars — the adapter", () => {
 		assert.equal(v["--destructive"], mocha.colors.error);
 		assert.equal(v["--lh-success"], mocha.colors.success);
 		assert.equal(v["--lh-warning"], mocha.colors.warning);
+	});
+});
+
+describe("OrbiTutor presets (issue 22, palette Grove)", () => {
+	const light = BUILTIN_THEMES.find((t) => t.id === "orbitutor-light")!;
+
+	it("the default id is OrbiTutor dark; the old palette is Classic", () => {
+		assert.equal(DEFAULT_THEME.id, "default");
+		assert.equal(DEFAULT_THEME.name, "OrbiTutor");
+		assert.equal(DEFAULT_THEME.mode, "dark");
+		assert.equal(light.mode, "light");
+		const classic = BUILTIN_THEMES.find((t) => t.id === "classic")!;
+		assert.equal(classic.colors.background, "#141414");
+		assert.equal(classic.colors.accent, "#8d8d8d");
+		assert.equal(classic.buttons, undefined);
+	});
+
+	it("buttons fill --primary; a theme without buttons keeps text on the page color", () => {
+		const v = themeVars(DEFAULT_THEME.colors, "dark", DEFAULT_THEME.buttons);
+		assert.equal(v["--primary"], "#2fd08a");
+		assert.equal(v["--primary-foreground"], "#0b2117");
+		const m = themeVars(mocha.colors, "dark", mocha.buttons);
+		assert.equal(m["--primary"], mocha.colors.text);
+		assert.equal(m["--primary-foreground"], mocha.colors.background);
+	});
+
+	it("every text pair passes WCAG AA (4.5:1), and the status inks 3:1", () => {
+		const lum = (hex: string) => {
+			const c = [1, 3, 5].map((i) => parseInt(hex.slice(i, i + 2), 16) / 255)
+				.map((x) => (x <= 0.03928 ? x / 12.92 : ((x + 0.055) / 1.055) ** 2.4));
+			return 0.2126 * c[0]! + 0.7152 * c[1]! + 0.0722 * c[2]!;
+		};
+		const ratio = (a: string, b: string) => {
+			const [x, y] = [lum(a), lum(b)].sort((p, q) => q - p);
+			return (x! + 0.05) / (y! + 0.05);
+		};
+		for (const t of [DEFAULT_THEME, light]) {
+			const c = t.colors;
+			const pairs: Array<[string, string, number]> = [
+				[c.text, c.background, 4.5], [c.text, c.surface, 4.5], [c.textMuted, c.background, 4.5],
+				[c.textMuted, c.surface, 4.5], [c.accent, c.background, 4.5], [c.italic, c.background, 4.5],
+				[c.bold, c.background, 4.5], [c.code, c.background, 4.5], [c.error, c.background, 4.5],
+				[t.buttons!.onPrimary, t.buttons!.primary, 4.5], [c.success, c.background, 3], [c.warning, c.background, 3],
+			];
+			for (const [fg, bg, need] of pairs) {
+				assert.ok(ratio(fg, bg) >= need, `${t.id}: ${fg} on ${bg} = ${ratio(fg, bg).toFixed(2)}`);
+			}
+		}
+	});
+
+	it("an import may carry buttons; bad buttons name the field", () => {
+		const withButtons = { ...validFile, buttons: { primary: "#2fd08a", onPrimary: "#0b2117" } };
+		assert.deepEqual(sanitizeThemeFile(withButtons), withButtons);
+		assert.match((parseThemeFile({ ...validFile, buttons: "green" }) as { error: string }).error, /buttons must be an object/);
+		assert.match((parseThemeFile({ ...validFile, buttons: { primary: "#2fd08a" } }) as { error: string }).error, /buttons\.onPrimary/);
 	});
 });
 
